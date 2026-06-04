@@ -198,14 +198,18 @@ fn parseAs(comptime Arg: type, arg: []const u8, allocator: std.mem.Allocator, co
         .pointer => |pointer| {
             switch (pointer.size) {
                 .slice => {
-                    var buf = try allocator.alloc(pointer.child, 100);
-                    var it = std.mem.splitSequence(u8, arg, ",");
-                    var i: u32 = 0;
-                    while (it.next()) |item| {
-                        buf[i] = try parseAs(pointer.child, item, allocator, null);
-                        i += 1;
+                    if (pointer.child == u8) {
+                        return arg;
+                    } else {
+                        var list = std.ArrayList(pointer.child).empty;
+                        var it = std.mem.splitSequence(u8, arg, ",");
+                        var i: u32 = 0;
+                        while (it.next()) |item| {
+                            try list.append(allocator, try parseAs(pointer.child, item, allocator, null));
+                            i += 1;
+                        }
+                        return list.items;
                     }
-                    return buf[0..i];
                 },
                 else => {
                     return ArgParseError.UnsupportedType;
