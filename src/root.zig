@@ -13,9 +13,45 @@ pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.All
     return parseArgv(Args, argv[1..], allocator);
 }
 
+fn arrayArgs(comptime fields: anytype) type {
+    var field_names: [10][]const u8 = undefined;
+    var field_types: [10]type = undefined;
+    var n_fields = 0;
+    inline for (fields) |field| {
+        switch (@typeInfo(field.type)) {
+            .pointer => |ptr| {
+                if (ptr.size == .slice and ptr.child != u8) {
+                    field_names[n_fields] = field.name;
+                    field_types[n_fields] = std.ArrayList(ptr.child);
+                    n_fields += 1;
+                }
+            },
+            else => {
+                continue;
+            },
+        }
+    }
+
+    return @Struct(.auto, null, field_names[0..n_fields], field_types[0..n_fields], &@splat(.{}));
+}
+
+fn initArrayArgs(
+    comptime Args: type,
+) Args {
+    var args: Args = undefined;
+
+    inline for (@typeInfo(Args).@"struct".fields) |field| {
+        @field(args, field.name) =
+            @TypeOf(@field(args, field.name)).empty;
+    }
+
+    return args;
+}
+
 fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.mem.Allocator) !Args {
     var args: Args = undefined;
     const fields = @typeInfo(Args).@"struct".fields;
+    var fieldArray = initArrayArgs(arrayArgs(fields));
     var fieldStates = std.StaticBitSet(fields.len).initEmpty();
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -74,25 +110,31 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                             .pointer => |pointer| {
                                 switch (pointer.size) {
                                     .slice => {
-                                        var buf = try allocator.alloc(pointer.child, 100);
-                                        var ii: usize = 0;
-                                        if (i < (argv.len - 1)) {
-                                            i += 1;
-                                        }
-                                        while (i < argv.len) : ({
-                                            i += 1;
-                                            ii += 1;
-                                        }) {
+                                        if (pointer.child == u8) {
+                                            if (i < (argv.len - 1)) {
+                                                i += 1;
+                                            }
                                             const next_arg: []const u8 = std.mem.span(argv[i]);
-                                            const parsed = parseArg(next_arg);
-                                            if (parsed == .value) {
-                                                buf[ii] = try parseAs(pointer.child, parsed.value, allocator, conversion);
-                                            } else {
-                                                i -= 1;
-                                                break;
+                                            @field(args, field.name) = next_arg;
+                                        } else {
+                                            var ii: usize = 0;
+                                            if (i < (argv.len - 1)) {
+                                                i += 1;
+                                            }
+                                            while (i < argv.len) : ({
+                                                i += 1;
+                                                ii += 1;
+                                            }) {
+                                                const next_arg: []const u8 = std.mem.span(argv[i]);
+                                                const parsed = parseArg(next_arg);
+                                                if (parsed == .value) {
+                                                    try @field(fieldArray, field.name).append(allocator, try parseAs(pointer.child, parsed.value, allocator, conversion));
+                                                } else {
+                                                    i -= 1;
+                                                    break;
+                                                }
                                             }
                                         }
-                                        @field(args, field.name) = buf[0..ii];
                                         handled = true;
                                     },
                                     else => {
@@ -124,6 +166,16 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                     return ArgParseError.ArgumentMissing;
                 },
             }
+        }
+        switch (@typeInfo(field.type)) {
+            .pointer => |ptr| {
+                if (ptr.size == .slice and ptr.child != u8) {
+                    @field(args, field.name) = @field(fieldArray, field.name).items;
+                }
+            },
+            else => {
+                continue;
+            },
         }
     }
     return args;
