@@ -6,6 +6,8 @@ pub const ArgParseError = error{
     UnknownArgument,
     NamedArgumentMissingValue,
     NeedsCustomConversion,
+    OptionMissing,
+    InvalidFlagStacking,
     Overflow,
     InvalidCharacter,
 };
@@ -88,9 +90,17 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
     var i_args: usize = 0;
     while (i_args < argv.len) : (i_args += 1) {
         const arg: []const u8 = std.mem.span(argv[i_args]);
-        const val = parseArg(arg);
+        const val = try parseArg(arg);
         var handled = false;
-        switch (val) {
+        blk: switch (val) {
+            .shortOptionWithValue => |shortNamed| {
+                inline for (fields) |field| {
+                    if (field.name[0] == shortNamed.key) {
+                        // trannsform into optionWitValue and jump
+                        continue :blk Argument{ .optionWithValue = .{ .key = field.name, .value = shortNamed.value } };
+                    }
+                }
+            },
             // named value with value
             .optionWithValue => |named| {
                 inline for (fields, 0..) |field, i_fields| {
@@ -143,6 +153,14 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                     }
                 }
             },
+            .shortOption => |short| {
+                inline for (fields) |field| {
+                    if (field.name[0] == short) {
+                        // trannsform into option and jump
+                        continue :blk Argument{ .option = field.name };
+                    }
+                }
+            },
             // flag or named value
             .option => |name| {
                 inline for (fields, 0..) |field, i_fields| {
@@ -162,7 +180,7 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                             var n_items: usize = 0;
                             while (i_args < argv.len) : (i_args += 1) {
                                 const next_arg: []const u8 = std.mem.span(argv[i_args]);
-                                const parsed = parseArg(next_arg);
+                                const parsed = try parseArg(next_arg);
                                 if (parsed == .value) {
                                     try @field(arrayFields, field.name).append(allocator, try parseAs(info.pointer.child, parsed.value, allocator, fieldConverter(
                                         Args,
@@ -194,7 +212,7 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                                 return ArgParseError.NamedArgumentMissingValue;
                             }
                             const next_arg: []const u8 = std.mem.span(argv[i_args]);
-                            const parsed = parseArg(next_arg);
+                            const parsed = try parseArg(next_arg);
                             if (parsed == .value) {
                                 @field(args, field.name) = try parseAs(field_type, parsed.value, allocator, fieldConverter(
                                     Args,
@@ -209,6 +227,9 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                         handled = true;
                     }
                 }
+            },
+            .flagStack => {
+                unreachable;
             },
         }
         if (!handled) {
@@ -264,27 +285,59 @@ const Argument = union(enum) {
     optionWithValue: struct { key: []const u8, value: []const u8 },
     value: []const u8,
     option: []const u8,
+    shortOptionWithValue: struct { key: u8, value: []const u8 },
+    shortOption: u8,
+    flagStack: []const u8, // array of chars
 };
 
-fn parseArg(arg: []const u8) Argument {
+fn parseArg(arg: []const u8) !Argument {
     if (std.mem.startsWith(u8, arg, "--")) {
+        if (arg.len < 3) {
+            return ArgParseError.OptionMissing;
+        }
         const is = std.mem.findPos(u8, arg, 2, "=");
         if (is) |pos| {
+            if (!(arg.len > pos)) {
+                return ArgParseError.NamedArgumentMissingValue;
+            }
             return .{ .optionWithValue = .{ .key = arg[2..pos], .value = arg[pos + 1 ..] } };
         }
+
         return .{ .option = arg[2..] };
+    }
+    if (std.mem.startsWith(u8, arg, "-")) {
+        if (arg.len == 2) {
+            return .{ .shortOption = arg[1] };
+        } else if (arg.len > 2) {
+            for (2..arg.len) |i| {
+                if (!std.ascii.isAlphabetic(arg[i])) {
+                    if (i < 1) {
+                        return ArgParseError.InvalidFlagStacking;
+                    } else if (i > 1) {
+                        return ArgParseError.InvalidFlagStacking;
+                    } else {
+                        break;
+                    }
+                }
+                if (i == arg.len) return .{ .flagStack = arg[2..] };
+            }
+            for (2..arg.len) |i| {
+                if (!std.ascii.isDigit(arg[i])) return ArgParseError.NamedArgumentMissingValue;
+            }
+            return .{ .shortOptionWithValue = .{ .key = arg[1], .value = arg[2..] } };
+        }
     }
     return .{ .value = arg };
 }
 
 test "parse different raw args" {
-    const pos_arg = parseArg("positional");
+    const pos_arg = try parseArg("positional");
     try std.testing.expect(pos_arg == .value);
     try std.testing.expectEqualStrings(pos_arg.value, "positional");
-    const flag_arg = parseArg("--flag");
+    const flag_arg = try parseArg("--flag");
     try std.testing.expect(flag_arg == .option);
     try std.testing.expectEqualStrings(flag_arg.option, "flag");
-    const named_arg = parseArg("--key=value");
+    const named_arg = try parseArg("--key=value");
     try std.testing.expect(named_arg == .optionWithValue);
     try std.testing.expectEqualStrings(named_arg.optionWithValue.key, "key");
     try std.testing.expectEqualStrings(named_arg.optionWithValue.value, "value");
