@@ -8,6 +8,8 @@ pub const ArgParseError = error{
     UnknownArgument,
     NamedArgumentMissingValue,
     NeedsCustomConversion,
+    Overflow,
+    InvalidCharacter,
 };
 
 pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.Allocator) !Args {
@@ -59,9 +61,22 @@ fn deinitArrayArgs(arrayFields: anytype, allocator: std.mem.Allocator) void {
 
 fn fieldConverter(comptime Args: type, fieldName: []const u8, comptime Arg: type) ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg {
     const conversionName = "to_" ++ fieldName;
-    if (@hasDecl(Args, conversionName)) {
-        return @field(Args, conversionName);
-    } else return null;
+    if (!@hasDecl(Args, conversionName)) {
+        return null;
+    }
+
+    const f = @field(Args, conversionName);
+
+    const ret = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+
+    const ok = switch (@typeInfo(ret)) {
+        .error_union => |eu| eu.payload == Arg,
+        else => false,
+    };
+
+    if (!ok) return null;
+
+    return f;
 }
 
 fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.mem.Allocator) !Args {
@@ -89,15 +104,22 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                             else => field.type,
                         };
                         const info = @typeInfo(field_type);
-                        const value = try parseAs(field_type, named.value, allocator, fieldConverter(
-                            Args,
-                            field.name,
-                            field_type,
-                        ));
                         if (info == .pointer and info.pointer.size == .slice and info.pointer.child != u8) {
-                            defer allocator.free(value);
-                            try @field(arrayFields, field.name).appendSlice(allocator, value);
+                            var argIt = std.mem.splitScalar(u8, named.value, ',');
+                            while (argIt.next()) |a| {
+                                const value = try parseAs(info.pointer.child, a, allocator, fieldConverter(
+                                    Args,
+                                    field.name,
+                                    info.pointer.child,
+                                ));
+                                try @field(arrayFields, field.name).append(allocator, value);
+                            }
                         } else {
+                            const value = try parseAs(field_type, named.value, allocator, fieldConverter(
+                                Args,
+                                field.name,
+                                field_type,
+                            ));
                             @field(args, field.name) = value;
                             fieldStates.set(i_fields);
                         }
@@ -242,29 +264,6 @@ fn parseAs(comptime Arg: type, arg: []const u8, allocator: std.mem.Allocator, co
         },
         .float => {
             return try std.fmt.parseFloat(Arg, arg);
-        },
-        .pointer => |pointer| {
-            switch (pointer.size) {
-                .slice => {
-                    if (pointer.child == u8) {
-                        return arg;
-                    } else {
-                        var list = std.ArrayList(pointer.child).empty;
-                        defer list.deinit(allocator);
-
-                        var it = std.mem.splitSequence(u8, arg, ",");
-                        var i: u32 = 0;
-                        while (it.next()) |item| {
-                            try list.append(allocator, try parseAs(pointer.child, item, allocator, null));
-                            i += 1;
-                        }
-                        return list.toOwnedSlice(allocator);
-                    }
-                },
-                else => {
-                    return ArgParseError.UnsupportedType;
-                },
-            }
         },
         else => {
             return ArgParseError.NeedsCustomConversion;
@@ -520,5 +519,77 @@ test "optional values" {
         const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
+    }
+}
+
+test "conversion provided" {
+    const allocator = std.testing.allocator;
+
+    const T = struct { int: u32 };
+    const S = struct {
+        custom: T,
+        fn to_custom(arg: []const u8, _: std.mem.Allocator) !T {
+            const val = try std.fmt.parseInt(u32, arg, 10);
+            return T{ .int = 69 + val };
+        }
+    };
+
+    {
+        const expected = S{ .custom = T{ .int = 70 } };
+        const args = [_][*:0]const u8{ "--custom", "1" };
+
+        const result = try parseArgv(S, args[0..], allocator);
+
+        try std.testing.expectEqual(expected, result);
+    }
+}
+
+test "conversion provided for array" {
+    const allocator = std.testing.allocator;
+
+    const T = struct { int: u32 };
+    const S = struct {
+        customArray: []T,
+        fn to_customArray(arg: []const u8, _: std.mem.Allocator) !T {
+            const val = try std.fmt.parseInt(u32, arg, 10);
+            return T{ .int = 69 + val };
+        }
+    };
+
+    const expectedArray = [_]T{ T{ .int = 70 }, T{ .int = 71 }, T{ .int = 72 } };
+    {
+        const args = [_][*:0]const u8{ "--customArray", "1", "2", "3" };
+
+        const result = try parseArgv(S, args[0..], allocator);
+        defer allocator.free(result.customArray);
+
+        try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
+    }
+
+    {
+        const args = [_][*:0]const u8{"--customArray=1,2,3"};
+
+        const result = try parseArgv(S, args[0..], allocator);
+        defer allocator.free(result.customArray);
+
+        try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
+    }
+
+    {
+        const args = [_][*:0]const u8{ "--customArray=1,2", "--customArray", "3" };
+
+        const result = try parseArgv(S, args[0..], allocator);
+        defer allocator.free(result.customArray);
+
+        try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
+    }
+
+    {
+        const args = [_][*:0]const u8{ "--customArray", "1", "--customArray=2,3" };
+
+        const result = try parseArgv(S, args[0..], allocator);
+        defer allocator.free(result.customArray);
+
+        try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
     }
 }
