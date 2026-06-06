@@ -2,9 +2,7 @@ const std = @import("std");
 
 pub const ArgParseError = error{
     ArgumentMissing,
-    UnsupportedType,
     DuplicateArgument,
-    ValueMissingForNamedField,
     UnknownArgument,
     NamedArgumentMissingValue,
     NeedsCustomConversion,
@@ -93,17 +91,16 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
         const val = parseArg(arg);
         var handled = false;
         switch (val) {
+            // named value with value
             .optionWithValue => |named| {
                 inline for (fields, 0..) |field, i_fields| {
                     if (std.mem.eql(u8, field.name, named.key)) {
-                        if (fieldStates.isSet(i_fields)) {
-                            return ArgParseError.DuplicateArgument;
-                        }
                         const field_type = switch (@typeInfo(field.type)) {
                             .optional => |opt| opt.child,
                             else => field.type,
                         };
                         const info = @typeInfo(field_type);
+                        // is array
                         if (info == .pointer and info.pointer.size == .slice and info.pointer.child != u8) {
                             var argIt = std.mem.splitScalar(u8, named.value, ',');
                             while (argIt.next()) |a| {
@@ -115,6 +112,9 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                                 try @field(arrayFields, field.name).append(allocator, value);
                             }
                         } else {
+                            if (fieldStates.isSet(i_fields)) {
+                                return ArgParseError.DuplicateArgument;
+                            }
                             const value = try parseAs(field_type, named.value, allocator, fieldConverter(
                                 Args,
                                 field.name,
@@ -127,6 +127,7 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                     }
                 }
             },
+            // positional argument
             .value => |value| {
                 var isSet = false;
                 inline for (fields, 0..) |field, i_fields| {
@@ -142,82 +143,70 @@ fn parseArgv(comptime Args: type, argv: []const [*:0]const u8, allocator: std.me
                     }
                 }
             },
+            // flag or named value
             .option => |name| {
                 inline for (fields, 0..) |field, i_fields| {
                     if (std.mem.eql(u8, field.name, name)) {
-                        switch (@typeInfo(field.type)) {
-                            .pointer => |pointer| {
-                                switch (pointer.size) {
-                                    .slice => {
-                                        if (pointer.child == u8) {
-                                            if (fieldStates.isSet(i_fields)) {
-                                                return ArgParseError.DuplicateArgument;
-                                            }
-                                            if (i_args < (argv.len - 1)) {
-                                                i_args += 1;
-                                            }
-                                            const next_arg: []const u8 = std.mem.span(argv[i_args]);
-                                            @field(args, field.name) = next_arg;
-                                        } else {
-                                            if (i_args < (argv.len - 1)) {
-                                                i_args += 1;
-                                            }
-                                            while (i_args < argv.len) : (i_args += 1) {
-                                                const next_arg: []const u8 = std.mem.span(argv[i_args]);
-                                                const parsed = parseArg(next_arg);
-                                                if (parsed == .value) {
-                                                    try @field(arrayFields, field.name).append(allocator, try parseAs(pointer.child, parsed.value, allocator, fieldConverter(
-                                                        Args,
-                                                        field.name,
-                                                        pointer.child,
-                                                    )));
-                                                } else {
-                                                    i_args -= 1;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        handled = true;
-                                    },
-                                    else => {
-                                        return ArgParseError.UnsupportedType;
-                                    },
-                                }
-                            },
-                            .bool => {
-                                if (fieldStates.isSet(i_fields)) {
-                                    return ArgParseError.DuplicateArgument;
-                                }
-                                @field(args, field.name) = true;
-                                handled = true;
-                                fieldStates.set(i_fields);
-                            },
-                            else => {
-                                if (fieldStates.isSet(i_fields)) {
-                                    return ArgParseError.DuplicateArgument;
-                                }
-                                if (i_args < (argv.len - 1)) {
-                                    i_args += 1;
-                                }
+                        const field_type = switch (@typeInfo(field.type)) {
+                            .optional => |opt| opt.child,
+                            else => field.type,
+                        };
+                        const info = @typeInfo(field_type);
+                        // is array
+                        if (info == .pointer and info.pointer.size == .slice and info.pointer.child != u8) {
+                            if (i_args < (argv.len - 1)) {
+                                i_args += 1;
+                            } else {
+                                return ArgParseError.NamedArgumentMissingValue;
+                            }
+                            var n_items: usize = 0;
+                            while (i_args < argv.len) : (i_args += 1) {
                                 const next_arg: []const u8 = std.mem.span(argv[i_args]);
                                 const parsed = parseArg(next_arg);
-                                const field_type = switch (@typeInfo(field.type)) {
-                                    .optional => |opt| opt.child,
-                                    else => field.type,
-                                };
                                 if (parsed == .value) {
-                                    @field(args, field.name) = try parseAs(field_type, parsed.value, allocator, fieldConverter(
+                                    try @field(arrayFields, field.name).append(allocator, try parseAs(info.pointer.child, parsed.value, allocator, fieldConverter(
                                         Args,
                                         field.name,
-                                        field_type,
-                                    ));
-                                    fieldStates.set(i_fields);
-                                    handled = true;
+                                        info.pointer.child,
+                                    )));
+                                    n_items += 1;
                                 } else {
-                                    return ArgParseError.NamedArgumentMissingValue;
+                                    if (n_items == 0) return ArgParseError.NamedArgumentMissingValue;
+                                    i_args -= 1;
+                                    break;
                                 }
-                            },
+                            }
                         }
+                        // is flag
+                        else if (info == .bool) {
+                            if (fieldStates.isSet(i_fields)) {
+                                return ArgParseError.DuplicateArgument;
+                            }
+                            @field(args, field.name) = true;
+                            fieldStates.set(i_fields);
+                        } else {
+                            if (fieldStates.isSet(i_fields)) {
+                                return ArgParseError.DuplicateArgument;
+                            }
+                            if (i_args < (argv.len - 1)) {
+                                i_args += 1;
+                            } else {
+                                return ArgParseError.NamedArgumentMissingValue;
+                            }
+                            const next_arg: []const u8 = std.mem.span(argv[i_args]);
+                            const parsed = parseArg(next_arg);
+                            if (parsed == .value) {
+                                @field(args, field.name) = try parseAs(field_type, parsed.value, allocator, fieldConverter(
+                                    Args,
+                                    field.name,
+                                    field_type,
+                                ));
+                                fieldStates.set(i_fields);
+                            } else {
+                                return ArgParseError.NamedArgumentMissingValue;
+                            }
+                        }
+                        handled = true;
                     }
                 }
             },
