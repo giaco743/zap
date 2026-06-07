@@ -126,27 +126,29 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
         var handled = false;
         switch (try arg) {
             .shortWithTail => |short| {
-                inline for (fields, 0..) |field, i| {
+                inline for (fields, 0..) |field, i_fields| {
                     if (getShort(Args, field.name)) |s| {
                         if (s == short.key) {
+                            // if first short is a flag the rest has to be flags as well
                             if (field.type == bool) {
-                                if (fieldStates.isSet(i)) {
+                                if (fieldStates.isSet(i_fields)) {
                                     return ArgParseError.DuplicateArgument;
                                 }
-                                @field(args, fields[i].name) = true;
-                                fieldStates.set(i);
+                                @field(args, fields[i_fields].name) = true;
+                                fieldStates.set(i_fields);
                                 handled = true;
 
-                                for (short.tail) |next_key| {
-                                    const sh = getShort(Args, field.name) orelse {
-                                        continue;
-                                    };
-                                    if (sh == next_key) {
-                                        @field(args, fields[i].name) = true;
-                                        fieldStates.set(i);
+                                inline for (fields, 0..) |f, i| {
+                                    if (getShort(Args, f.name)) |ss| {
+                                        if (std.mem.containsAtLeastScalar2(u8, short.tail, 1, ss)) {
+                                            if (field.type != bool) return ArgParseError.InvalidShort;
+                                            @field(args, fields[i].name) = true;
+                                            fieldStates.set(i);
+                                        }
                                     }
                                 }
-                            } else {
+                            } // otherwise it has to be a value
+                            else {
                                 const field_type = switch (@typeInfo(field.type)) {
                                     .optional => |opt| opt.child,
                                     else => field.type,
@@ -164,7 +166,7 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
                                         try @field(arrayFields, field.name).append(allocator, value);
                                     }
                                 } else {
-                                    if (fieldStates.isSet(i)) {
+                                    if (fieldStates.isSet(i_fields)) {
                                         return ArgParseError.DuplicateArgument;
                                     }
                                     const value = try parseAs(field_type, short.tail, allocator, fieldConverter(
@@ -173,8 +175,9 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
                                         field_type,
                                     ));
                                     @field(args, field.name) = value;
-                                    fieldStates.set(i);
+                                    fieldStates.set(i_fields);
                                 }
+                                handled = true;
                             }
                         }
                     }
@@ -752,7 +755,7 @@ test "conversion provided for array" {
     }
 }
 
-test "shot provided" {
+test "short provided" {
     const allocator = std.testing.allocator;
 
     const S = struct {
@@ -763,6 +766,25 @@ test "shot provided" {
     {
         const expected = S{ .int = 1 };
         const args = [_][*:0]const u8{ "-n", "1" };
+        var cursor = ArgCursor.init(args[0..]);
+        const result = try parseArgv(S, &cursor, allocator);
+
+        try std.testing.expectEqual(expected, result);
+    }
+}
+
+test "short disabled" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        int: u32,
+        integer: u32,
+        const short_int: ?u8 = null;
+    };
+
+    {
+        const expected = S{ .int = 2, .integer = 1 };
+        const args = [_][*:0]const u8{ "-i", "1", "--int", "2" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
