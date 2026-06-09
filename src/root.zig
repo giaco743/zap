@@ -9,24 +9,26 @@ pub const ArgParseError = error{
     OptionMissing,
     InvalidShort,
     InvalidLong,
+    FlagWithValue,
     Overflow,
+    EndOfOptions,
     InvalidCharacter,
     AmbiguousShort,
+    FlagAsPositional,
 };
 
 const ArgCursor = struct {
-    argv: []const [*:0]const u8,
+    argv: []const []const u8,
     index: usize,
 
-    fn init(argv: []const [*:0]const u8) ArgCursor {
+    fn init(argv: []const []const u8) ArgCursor {
         return ArgCursor{ .argv = argv, .index = 0 };
     }
     fn peek(self: *ArgCursor) ?ArgParseError!ArgToken {
         if (self.index >= self.argv.len) {
             return null;
         }
-        const arg: []const u8 = std.mem.span(self.argv[self.index]);
-        return try parseArg(arg);
+        return try parseArg(self.argv[self.index]);
     }
     fn next(self: *ArgCursor) ?ArgParseError!ArgToken {
         if (self.peek()) |arg| {
@@ -38,8 +40,10 @@ const ArgCursor = struct {
 };
 
 pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.Allocator) !Args {
-    const cursor = ArgCursor.init(args.vector);
-    return parseArgv(Args, cursor, allocator);
+    const argv = argvToSlices(allocator, args.vector);
+    defer argv.free(allocator);
+    const cursor = ArgCursor.init(argv);
+    return parseArgv(Args, &cursor, allocator);
 }
 
 fn arrayArgs(comptime fields: anytype) type {
@@ -84,6 +88,13 @@ fn deinitArrayArgs(arrayFields: anytype, allocator: std.mem.Allocator) void {
     }
 }
 
+fn stripOpt(comptime Type: type) type {
+    switch (@typeInfo(Type)) {
+        .optional => |opt| return opt.child,
+        else => return Type,
+    }
+}
+
 fn fieldConverter(comptime Args: type, fieldName: []const u8, comptime Arg: type) ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg {
     const conversionName = "to_" ++ fieldName;
     if (!@hasDecl(Args, conversionName)) {
@@ -104,6 +115,16 @@ fn fieldConverter(comptime Args: type, fieldName: []const u8, comptime Arg: type
     return f;
 }
 
+fn isSlice(comptime Type: type) bool {
+    const info = @typeInfo(Type);
+    return info == .pointer and info.pointer.size == .slice and info.pointer.child != u8;
+}
+
+fn isFlag(comptime Type: type) bool {
+    const info = @typeInfo(Type);
+    return info == .bool;
+}
+
 fn getShort(comptime Args: type, comptime name: []const u8) ?u8 {
     if (name.len == 0) return null;
     if (std.mem.startsWith(u8, name, "_")) return null;
@@ -114,6 +135,93 @@ fn getShort(comptime Args: type, comptime name: []const u8) ?u8 {
     return name[0];
 }
 
+fn setArrayArg(
+    comptime Item: type,
+    array: *std.ArrayList(Item),
+    conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Item,
+    cursor: *ArgCursor,
+    allocator: std.mem.Allocator,
+) !void {
+    // check if next arg
+    if (cursor.peek()) |next| {
+        if (try next != .value) {
+            return ArgParseError.NamedArgumentMissingValue;
+        }
+    } else {
+        return ArgParseError.NamedArgumentMissingValue;
+    }
+    while (cursor.next()) |argument| {
+        const next_arg = try argument;
+        try array.append(allocator, try parseAs(
+            Item,
+            next_arg.value,
+            allocator,
+            conversion,
+        ));
+        if (cursor.peek()) |next| {
+            if (try next != .value) {
+                break;
+            }
+        }
+    }
+}
+
+fn setArg(
+    comptime Arg: type,
+    field: *Arg,
+    value: []const u8,
+    conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg,
+    allocator: std.mem.Allocator,
+) !void {
+    comptime {
+        if (isSlice(Arg)) {
+            @compileError("Always make sure it is not an array");
+        }
+    }
+    if (@typeInfo(Arg) == .bool) {
+        field.* = true;
+    } else {
+        field.* = try parseAs(Arg, value, allocator, conversion);
+    }
+}
+
+fn setField(
+    comptime Args: type,
+    comptime Arg: type,
+    comptime ArrayFields: type,
+    comptime fieldName: []const u8,
+    field: *Arg,
+    arrayFields: *ArrayFields,
+    cursor: *ArgCursor,
+    allocator: std.mem.Allocator,
+) !bool {
+    if (comptime isSlice(Arg)) {
+        const fieldPtr = &@field(arrayFields, fieldName);
+        const child = @typeInfo(Arg).pointer.child;
+        try setArrayArg(child, fieldPtr, fieldConverter(
+            Args,
+            fieldName,
+            child,
+        ), cursor, allocator);
+        return false;
+    } else if (comptime isFlag(Arg)) {
+        field.* = true;
+        return true;
+    } else {
+        if (cursor.next()) |value| {
+            const val = try value;
+            if (val == .value) {
+                field.* = try parseAs(Arg, val.value, allocator, fieldConverter(Args, fieldName, Arg));
+                return true;
+            } else {
+                return ArgParseError.NamedArgumentMissingValue;
+            }
+        } else {
+            return ArgParseError.NamedArgumentMissingValue;
+        }
+    }
+}
+
 fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocator) !Args {
     var args: Args = undefined;
 
@@ -122,21 +230,22 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
     defer deinitArrayArgs(&arrayFields, allocator);
     var fieldStates = std.StaticBitSet(fields.len).initEmpty();
 
-    while (cursor.next()) |arg| {
-        var handled = false;
+    var endOfOptions = false;
+    next: while (cursor.next()) |arg| {
         switch (try arg) {
             .shortWithTail => |short| {
+                if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
                     if (getShort(Args, field.name)) |s| {
                         if (s == short.key) {
+                            if (fieldStates.isSet(i_fields)) {
+                                return ArgParseError.DuplicateArgument;
+                            }
+
                             // if first short is a flag the rest has to be flags as well
-                            if (field.type == bool) {
-                                if (fieldStates.isSet(i_fields)) {
-                                    return ArgParseError.DuplicateArgument;
-                                }
+                            if (comptime field.type == bool) {
                                 @field(args, fields[i_fields].name) = true;
                                 fieldStates.set(i_fields);
-                                handled = true;
 
                                 inline for (fields, 0..) |f, i| {
                                     if (getShort(Args, f.name)) |ss| {
@@ -148,227 +257,132 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
                                     }
                                 }
                             } // otherwise it has to be a value
-                            else {
-                                const field_type = switch (@typeInfo(field.type)) {
-                                    .optional => |opt| opt.child,
-                                    else => field.type,
-                                };
-                                const info = @typeInfo(field_type);
-                                // is array
-                                if (info == .pointer and info.pointer.size == .slice and info.pointer.child != u8) {
-                                    var argIt = std.mem.splitScalar(u8, short.tail, ',');
-                                    while (argIt.next()) |a| {
-                                        const value = try parseAs(info.pointer.child, a, allocator, fieldConverter(
-                                            Args,
-                                            field.name,
-                                            info.pointer.child,
-                                        ));
-                                        try @field(arrayFields, field.name).append(allocator, value);
-                                    }
-                                } else {
-                                    if (fieldStates.isSet(i_fields)) {
-                                        return ArgParseError.DuplicateArgument;
-                                    }
-                                    const value = try parseAs(field_type, short.tail, allocator, fieldConverter(
-                                        Args,
-                                        field.name,
-                                        field_type,
-                                    ));
-                                    @field(args, field.name) = value;
-                                    fieldStates.set(i_fields);
-                                }
-                                handled = true;
+                            else if (comptime isSlice(field.type)) {
+                                try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                                    Args,
+                                    field.name,
+                                    @typeInfo(field.type).pointer.child,
+                                ), cursor, allocator);
+                            } else {
+                                @field(args, field.name) = try parseAs(field.type, short.tail, allocator, fieldConverter(
+                                    Args,
+                                    field.name,
+                                    field.type,
+                                ));
+                                fieldStates.set(i_fields);
                             }
+                            continue :next;
                         }
                     }
                 }
             },
             // named value with value
             .longWithValue => |named| {
+                if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
                     if (std.mem.eql(u8, field.name, named.key)) {
-                        const field_type = switch (@typeInfo(field.type)) {
-                            .optional => |opt| opt.child,
-                            else => field.type,
-                        };
-                        const info = @typeInfo(field_type);
-                        // is array
-                        if (info == .pointer and info.pointer.size == .slice and info.pointer.child != u8) {
-                            var argIt = std.mem.splitScalar(u8, named.value, ',');
-                            while (argIt.next()) |a| {
-                                const value = try parseAs(info.pointer.child, a, allocator, fieldConverter(
-                                    Args,
-                                    field.name,
-                                    info.pointer.child,
-                                ));
-                                try @field(arrayFields, field.name).append(allocator, value);
+                        if (fieldStates.isSet(i_fields)) {
+                            return ArgParseError.DuplicateArgument;
+                        }
+
+                        // if first short is a flag the rest has to be flags as well
+                        if (comptime field.type == bool) {
+                            return ArgParseError.FlagWithValue;
+                        } // otherwise it has to be a value
+                        else if (comptime isSlice(field.type)) {
+                            var it = std.mem.splitScalar(u8, named.value, ',');
+                            var list = std.ArrayList([]const u8).empty;
+                            defer list.deinit(allocator);
+
+                            while (it.next()) |item| {
+                                const next: []const u8 = item;
+                                try list.append(allocator, next);
                             }
-                        } else {
-                            if (fieldStates.isSet(i_fields)) {
-                                return ArgParseError.DuplicateArgument;
-                            }
-                            const value = try parseAs(field_type, named.value, allocator, fieldConverter(
+                            var argArrayCursor = ArgCursor.init(list.items);
+                            try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
                                 Args,
                                 field.name,
-                                field_type,
+                                @typeInfo(field.type).pointer.child,
+                            ), &argArrayCursor, allocator);
+                        } else {
+                            @field(args, field.name) = try parseAs(field.type, named.value, allocator, fieldConverter(
+                                Args,
+                                field.name,
+                                field.type,
                             ));
-                            @field(args, field.name) = value;
                             fieldStates.set(i_fields);
                         }
-                        handled = true;
+                        continue :next;
                     }
                 }
             },
             // positional argument
             .value => |value| {
-                var isSet = false;
                 inline for (fields, 0..) |field, i_fields| {
-                    if (!isSet and std.mem.startsWith(u8, field.name, "_") and !fieldStates.isSet(i_fields)) {
-                        @field(args, field.name) = try parseAs(field.type, value, allocator, fieldConverter(
-                            Args,
-                            field.name,
-                            field.type,
-                        ));
+                    if (!fieldStates.isSet(i_fields)) {
+                        if (comptime field.type == bool) {
+                            return ArgParseError.FlagAsPositional;
+                        } // otherwise it has to be a value
+                        else if (comptime isSlice(field.type)) {
+                            try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                                Args,
+                                field.name,
+                                @typeInfo(field.type).pointer.child,
+                            ), cursor, allocator);
+                        } else {
+                            @field(args, field.name) = try parseAs(field.type, value, allocator, fieldConverter(
+                                Args,
+                                field.name,
+                                field.type,
+                            ));
+                        }
                         fieldStates.set(i_fields);
-                        isSet = true;
-                        handled = true;
+                        continue :next;
                     }
                 }
             },
+            // short flag or named value
             .short => |short| {
+                if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
                     if (getShort(Args, field.name)) |s| {
                         if (s == short) {
-                            if (@typeInfo(field.type) == .bool) {
-                                if (fieldStates.isSet(i_fields)) {
-                                    return ArgParseError.DuplicateArgument;
-                                }
-                                @field(args, field.name) = true;
-                                fieldStates.set(i_fields);
-                            } else {
-                                const field_type = switch (@typeInfo(field.type)) {
-                                    .optional => |opt| opt.child,
-                                    else => field.type,
-                                };
-                                const info = @typeInfo(field_type);
-                                // is array
-                                if (info == .pointer and info.pointer.size == .slice and info.pointer.child != u8) {
-                                    // check if next arg
-                                    if (cursor.peek()) |next| {
-                                        if (try next != .value) {
-                                            return ArgParseError.NamedArgumentMissingValue;
-                                        }
-                                    } else {
-                                        return ArgParseError.NamedArgumentMissingValue;
-                                    }
-                                    while (cursor.next()) |argument| {
-                                        const next_arg = try argument;
-                                        try @field(arrayFields, field.name).append(allocator, try parseAs(info.pointer.child, next_arg.value, allocator, fieldConverter(
-                                            Args,
-                                            field.name,
-                                            info.pointer.child,
-                                        )));
-                                        if (cursor.peek()) |next| {
-                                            if (try next != .value) {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    if (fieldStates.isSet(i_fields)) {
-                                        return ArgParseError.DuplicateArgument;
-                                    }
-                                    const next_arg = cursor.next() orelse {
-                                        return ArgParseError.NamedArgumentMissingValue;
-                                    };
-                                    const parsed = try next_arg;
-                                    if (parsed == .value) {
-                                        @field(args, field.name) = try parseAs(field_type, parsed.value, allocator, fieldConverter(
-                                            Args,
-                                            field.name,
-                                            field_type,
-                                        ));
-                                        fieldStates.set(i_fields);
-                                    } else {
-                                        return ArgParseError.NamedArgumentMissingValue;
-                                    }
-                                }
+                            if (fieldStates.isSet(i_fields)) {
+                                return ArgParseError.DuplicateArgument;
                             }
-                            handled = true;
+
+                            const wasSet = try setField(Args, field.type, @TypeOf(arrayFields), field.name, &@field(args, field.name), &arrayFields, cursor, allocator);
+                            if (wasSet) {
+                                fieldStates.set(i_fields);
+                            }
+                            continue :next;
                         }
                     }
                 }
             },
             // flag or named value
             .long => |name| {
+                if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
                     if (std.mem.eql(u8, field.name, name)) {
-                        if (@typeInfo(field.type) == .bool) {
-                            if (fieldStates.isSet(i_fields)) {
-                                return ArgParseError.DuplicateArgument;
-                            }
-                            @field(args, field.name) = true;
-                            fieldStates.set(i_fields);
-                        } else {
-                            const field_type = switch (@typeInfo(field.type)) {
-                                .optional => |opt| opt.child,
-                                else => field.type,
-                            };
-                            const info = @typeInfo(field_type);
-                            // is array
-                            if (info == .pointer and info.pointer.size == .slice and info.pointer.child != u8) {
-                                // check if next arg
-                                if (cursor.peek()) |next| {
-                                    if (try next != .value) {
-                                        return ArgParseError.NamedArgumentMissingValue;
-                                    }
-                                } else {
-                                    return ArgParseError.NamedArgumentMissingValue;
-                                }
-                                while (cursor.next()) |argument| {
-                                    const next_arg = try argument;
-                                    try @field(arrayFields, field.name).append(allocator, try parseAs(info.pointer.child, next_arg.value, allocator, fieldConverter(
-                                        Args,
-                                        field.name,
-                                        info.pointer.child,
-                                    )));
-                                    if (cursor.peek()) |next| {
-                                        if (try next != .value) {
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else {
-                                if (fieldStates.isSet(i_fields)) {
-                                    return ArgParseError.DuplicateArgument;
-                                }
-                                const next_arg = cursor.next() orelse {
-                                    return ArgParseError.NamedArgumentMissingValue;
-                                };
-                                const parsed = try next_arg;
-                                if (parsed == .value) {
-                                    @field(args, field.name) = try parseAs(field_type, parsed.value, allocator, fieldConverter(
-                                        Args,
-                                        field.name,
-                                        field_type,
-                                    ));
-                                    fieldStates.set(i_fields);
-                                } else {
-                                    return ArgParseError.NamedArgumentMissingValue;
-                                }
-                            }
+                        if (fieldStates.isSet(i_fields)) {
+                            return ArgParseError.DuplicateArgument;
                         }
-                        handled = true;
+                        const wasSet = try setField(Args, field.type, @TypeOf(arrayFields), field.name, &@field(args, field.name), &arrayFields, cursor, allocator);
+                        if (wasSet) {
+                            fieldStates.set(i_fields);
+                        }
+                        continue :next;
                     }
                 }
             },
             .endOfOptions => {
-                unreachable;
+                if (endOfOptions) return ArgParseError.EndOfOptions;
+                endOfOptions = true;
+                continue :next;
             },
         }
-        if (!handled) {
-            return ArgParseError.UnknownArgument;
-        }
+        return ArgParseError.UnknownArgument;
     }
 
     // Check if all mandatory fields are set and handle unset flags and optionals
@@ -396,23 +410,38 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
 }
 
 fn parseAs(comptime Arg: type, arg: []const u8, allocator: std.mem.Allocator, conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg) !Arg {
+    std.debug.print("Parsing: {s} as {any}\n", .{ arg, Arg });
+    const argType = stripOpt(Arg);
     if (conversion) |convert| {
         return try convert(arg, allocator);
     }
-    if (Arg == []const u8) {
+    if (argType == []const u8) {
         return arg;
     }
-    switch (@typeInfo(Arg)) {
+    switch (@typeInfo(argType)) {
         .int => {
-            return try std.fmt.parseInt(Arg, arg, 10);
+            return try std.fmt.parseInt(argType, arg, 10);
         },
         .float => {
-            return try std.fmt.parseFloat(Arg, arg);
+            return try std.fmt.parseFloat(argType, arg);
         },
         else => {
             return ArgParseError.NeedsCustomConversion;
         },
     }
+}
+
+fn argvToSlices(
+    allocator: std.mem.Allocator,
+    argv: []const [*:0]const u8,
+) ![][]const u8 {
+    const result = try allocator.alloc([]const u8, argv.len);
+
+    for (argv, 0..) |arg, i| {
+        result[i] = std.mem.span(arg);
+    }
+
+    return result;
 }
 
 const ArgToken = union(enum) {
@@ -470,7 +499,7 @@ test "parse positional args basic" {
         _text: []const u8,
     };
 
-    const args = [_][*:0]const u8{ "42", "hello" };
+    const args = [_][]const u8{ "42", "hello" };
     var cursor = ArgCursor.init(args[0..]);
     const result = try parseArgv(S, &cursor, allocator);
 
@@ -485,7 +514,7 @@ test "named argument parsing" {
         key: []const u8,
     };
 
-    const args = [_][*:0]const u8{"--key=zig"};
+    const args = [_][]const u8{"--key=zig"};
     var cursor = ArgCursor.init(args[0..]);
     const result = try parseArgv(S, &cursor, allocator);
 
@@ -499,7 +528,7 @@ test "boolean flag parsing" {
         flag: bool,
     };
 
-    const args = [_][*:0]const u8{"--flag"};
+    const args = [_][]const u8{"--flag"};
     var cursor = ArgCursor.init(args[0..]);
     const result = try parseArgv(S, &cursor, allocator);
 
@@ -513,7 +542,7 @@ test "unknown argument returns error" {
         _int: i32,
     };
 
-    const args = [_][*:0]const u8{"--something"};
+    const args = [_][]const u8{"--something"};
     var cursor = ArgCursor.init(args[0..]);
     const result = parseArgv(S, &cursor, allocator);
 
@@ -531,7 +560,7 @@ test "missing required positional argument" {
         _text: []const u8,
     };
 
-    const args = [_][*:0]const u8{"123"};
+    const args = [_][]const u8{"123"};
     var cursor = ArgCursor.init(args[0..]);
     const result = parseArgv(S, &cursor, allocator);
 
@@ -549,7 +578,7 @@ test "mixed named and positional args" {
         name: []const u8,
     };
 
-    const args = [_][*:0]const u8{
+    const args = [_][]const u8{
         "--name=zig",
         "7",
     };
@@ -567,7 +596,7 @@ test "duplicate named argument returns error" {
         key: []const u8,
     };
 
-    const args = [_][*:0]const u8{
+    const args = [_][]const u8{
         "--key=first",
         "--key=second",
     };
@@ -583,7 +612,7 @@ test "positional order stability" {
         _text: []const u8,
     };
 
-    const args = [_][*:0]const u8{ "99", "world" };
+    const args = [_][]const u8{ "99", "world" };
     var cursor = ArgCursor.init(args[0..]);
     const result = try parseArgv(S, &cursor, allocator);
 
@@ -600,7 +629,7 @@ test "allocated arrays" {
 
     const expected = [_]i32{ 1, 2, 3 };
     {
-        const args = [_][*:0]const u8{ "--int", "1", "2", "3" };
+        const args = [_][]const u8{ "--int", "1", "2", "3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.int);
@@ -608,7 +637,7 @@ test "allocated arrays" {
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
-        const args = [_][*:0]const u8{"--int=1,2,3"};
+        const args = [_][]const u8{"--int=1,2,3"};
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.int);
@@ -616,7 +645,7 @@ test "allocated arrays" {
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
-        const args = [_][*:0]const u8{ "--int=1,2", "--int", "3" };
+        const args = [_][]const u8{ "--int=1,2", "--int", "3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.int);
@@ -624,7 +653,7 @@ test "allocated arrays" {
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
-        const args = [_][*:0]const u8{ "--int", "1", "--int=2,3" };
+        const args = [_][]const u8{ "--int", "1", "--int=2,3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.int);
@@ -632,7 +661,7 @@ test "allocated arrays" {
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
-        const args = [_][*:0]const u8{ "--int", "1", "--int=2", "--int", "3" };
+        const args = [_][]const u8{ "--int", "1", "--int=2", "--int", "3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.int);
@@ -648,7 +677,7 @@ test "optional values" {
 
     {
         const expected = S{ .int = 1, .float = 2.3 };
-        const args = [_][*:0]const u8{ "--int", "1", "--float=2.3" };
+        const args = [_][]const u8{ "--int", "1", "--float=2.3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
@@ -657,7 +686,7 @@ test "optional values" {
 
     {
         const expected = S{ .int = 1, .float = null };
-        const args = [_][*:0]const u8{ "--int", "1" };
+        const args = [_][]const u8{ "--int", "1" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
@@ -666,7 +695,7 @@ test "optional values" {
 
     {
         const expected = S{ .int = null, .float = 2.3 };
-        const args = [_][*:0]const u8{"--float=2.3"};
+        const args = [_][]const u8{"--float=2.3"};
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
@@ -675,7 +704,7 @@ test "optional values" {
 
     {
         const expected = S{ .int = null, .float = null };
-        const args = [_][*:0]const u8{};
+        const args = [_][]const u8{};
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
@@ -697,7 +726,7 @@ test "conversion provided" {
 
     {
         const expected = S{ .custom = T{ .int = 70 } };
-        const args = [_][*:0]const u8{ "--custom", "1" };
+        const args = [_][]const u8{ "--custom", "1" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
@@ -719,7 +748,7 @@ test "conversion provided for array" {
 
     const expectedArray = [_]T{ T{ .int = 70 }, T{ .int = 71 }, T{ .int = 72 } };
     {
-        const args = [_][*:0]const u8{ "--customArray", "1", "2", "3" };
+        const args = [_][]const u8{ "--customArray", "1", "2", "3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.customArray);
@@ -728,7 +757,7 @@ test "conversion provided for array" {
     }
 
     {
-        const args = [_][*:0]const u8{"--customArray=1,2,3"};
+        const args = [_][]const u8{"--customArray=1,2,3"};
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.customArray);
@@ -737,7 +766,7 @@ test "conversion provided for array" {
     }
 
     {
-        const args = [_][*:0]const u8{ "--customArray=1,2", "--customArray", "3" };
+        const args = [_][]const u8{ "--customArray=1,2", "--customArray", "3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.customArray);
@@ -746,7 +775,7 @@ test "conversion provided for array" {
     }
 
     {
-        const args = [_][*:0]const u8{ "--customArray", "1", "--customArray=2,3" };
+        const args = [_][]const u8{ "--customArray", "1", "--customArray=2,3" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
         defer allocator.free(result.customArray);
@@ -765,7 +794,7 @@ test "short provided" {
 
     {
         const expected = S{ .int = 1 };
-        const args = [_][*:0]const u8{ "-n", "1" };
+        const args = [_][]const u8{ "-n", "1" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
@@ -784,7 +813,7 @@ test "short disabled" {
 
     {
         const expected = S{ .int = 2, .integer = 1 };
-        const args = [_][*:0]const u8{ "-i", "1", "--int", "2" };
+        const args = [_][]const u8{ "-i", "1", "--int", "2" };
         var cursor = ArgCursor.init(args[0..]);
         const result = try parseArgv(S, &cursor, allocator);
 
