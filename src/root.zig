@@ -17,33 +17,10 @@ pub const ArgParseError = error{
     FlagAsPositional,
 };
 
-const ArgCursor = struct {
-    argv: []const []const u8,
-    index: usize,
-
-    fn init(argv: []const []const u8) ArgCursor {
-        return ArgCursor{ .argv = argv, .index = 0 };
-    }
-    fn peek(self: *ArgCursor) ?ArgParseError!ArgToken {
-        if (self.index >= self.argv.len) {
-            return null;
-        }
-        return try parseArg(self.argv[self.index]);
-    }
-    fn next(self: *ArgCursor) ?ArgParseError!ArgToken {
-        if (self.peek()) |arg| {
-            self.index += 1;
-            return arg;
-        }
-        return null;
-    }
-};
-
 pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.Allocator) !Args {
-    const argv = argvToSlices(allocator, args.vector);
-    defer argv.free(allocator);
-    const cursor = ArgCursor.init(argv);
-    return parseArgv(Args, &cursor, allocator);
+    const argv = try argvToSlices(allocator, args.vector);
+    defer allocator.free(argv);
+    return try parseArgv(Args, argv[1..], allocator);
 }
 
 fn arrayArgs(comptime fields: anytype) type {
@@ -151,31 +128,33 @@ fn setArrayArg(
     comptime Item: type,
     array: *std.ArrayList(Item),
     conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Item,
-    cursor: *ArgCursor,
+    argv: []const []const u8,
     allocator: std.mem.Allocator,
-) !void {
-    // check if next arg
-    if (cursor.peek()) |next| {
-        if (try next != .value) {
+) !usize { // number of additionally handled fields, so I can increment always at the end of the loop with the syntax
+    if (argv.len > 0) {
+        if (try parseArg(argv[0]) != .value) {
             return ArgParseError.NamedArgumentMissingValue;
         }
     } else {
         return ArgParseError.NamedArgumentMissingValue;
     }
-    while (cursor.next()) |argument| {
-        const next_arg = try argument;
+    var i: usize = 0;
+    while (i < argv.len) {
+        const next_arg = try parseArg(argv[i]);
         try array.append(allocator, try parseAs(
             Item,
             next_arg.value,
             allocator,
             conversion,
         ));
-        if (cursor.peek()) |next| {
-            if (try next != .value) {
+        if (argv.len > i + 1) {
+            if (try parseArg(argv[i + 1]) != .value) {
                 break;
             }
         }
+        i += 1;
     }
+    return i;
 }
 
 fn setArg(
@@ -197,44 +176,7 @@ fn setArg(
     }
 }
 
-fn setField(
-    comptime Args: type,
-    comptime Arg: type,
-    comptime ArrayFields: type,
-    comptime fieldName: []const u8,
-    field: *Arg,
-    arrayFields: *ArrayFields,
-    cursor: *ArgCursor,
-    allocator: std.mem.Allocator,
-) !bool {
-    if (comptime isSlice(Arg)) {
-        const fieldPtr = &@field(arrayFields, fieldName);
-        const child = @typeInfo(Arg).pointer.child;
-        try setArrayArg(child, fieldPtr, fieldConverter(
-            Args,
-            fieldName,
-            child,
-        ), cursor, allocator);
-        return false;
-    } else if (comptime isFlag(Arg)) {
-        field.* = true;
-        return true;
-    } else {
-        if (cursor.next()) |value| {
-            const val = try value;
-            if (val == .value) {
-                field.* = try parseAs(Arg, val.value, allocator, fieldConverter(Args, fieldName, Arg));
-                return true;
-            } else {
-                return ArgParseError.NamedArgumentMissingValue;
-            }
-        } else {
-            return ArgParseError.NamedArgumentMissingValue;
-        }
-    }
-}
-
-fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocator) !Args {
+fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.Allocator) !Args {
     var args: Args = undefined;
 
     const fields = @typeInfo(Args).@"struct".fields;
@@ -243,12 +185,14 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
     var fieldStates = std.StaticBitSet(fields.len).initEmpty();
 
     var endOfOptions = false;
-    next: while (cursor.next()) |arg| {
-        switch (try arg) {
+    var i: usize = 0;
+    next: while (i < argv.len) : (i += 1) {
+        const arg = try parseArg(argv[i]);
+        switch (arg) {
             .shortWithTail => |short| {
                 if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
-                    if (getShort(Args, field.name)) |s| {
+                    if (comptime getShort(Args, field.name)) |s| {
                         if (s == short.key) {
                             if (fieldStates.isSet(i_fields)) {
                                 return ArgParseError.DuplicateArgument;
@@ -259,22 +203,25 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
                                 @field(args, fields[i_fields].name) = true;
                                 fieldStates.set(i_fields);
 
-                                inline for (fields, 0..) |f, i| {
-                                    if (getShort(Args, f.name)) |ss| {
+                                inline for (fields, 0..) |f, j| {
+                                    if (comptime getShort(Args, f.name)) |ss| {
                                         if (std.mem.containsAtLeastScalar2(u8, short.tail, 1, ss)) {
-                                            if (field.type != bool) return ArgParseError.InvalidShort;
-                                            @field(args, fields[i].name) = true;
-                                            fieldStates.set(i);
+                                            if (comptime isFlag(f.type)) {
+                                                @field(args, fields[j].name) = true;
+                                                fieldStates.set(j);
+                                            } else {
+                                                return ArgParseError.InvalidShort;
+                                            }
                                         }
                                     }
                                 }
                             } // otherwise it has to be a value
                             else if (comptime isSlice(field.type)) {
-                                try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
                                     Args,
                                     field.name,
                                     @typeInfo(field.type).pointer.child,
-                                ), cursor, allocator);
+                                ), argv[i..], allocator);
                             } else {
                                 @field(args, field.name) = try parseAs(field.type, short.tail, allocator, fieldConverter(
                                     Args,
@@ -310,12 +257,11 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
                                 const next: []const u8 = item;
                                 try list.append(allocator, next);
                             }
-                            var argArrayCursor = ArgCursor.init(list.items);
-                            try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                            _ = try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
                                 Args,
                                 field.name,
                                 @typeInfo(field.type).pointer.child,
-                            ), &argArrayCursor, allocator);
+                            ), list.items, allocator);
                         } else {
                             @field(args, field.name) = try parseAs(field.type, named.value, allocator, fieldConverter(
                                 Args,
@@ -336,11 +282,11 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
                             return ArgParseError.FlagAsPositional;
                         } // otherwise it has to be a value
                         else if (comptime isSlice(field.type)) {
-                            try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                            i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
                                 Args,
                                 field.name,
                                 @typeInfo(field.type).pointer.child,
-                            ), cursor, allocator);
+                            ), argv[i..], allocator);
                         } else {
                             @field(args, field.name) = try parseAs(field.type, value, allocator, fieldConverter(
                                 Args,
@@ -357,14 +303,32 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
             .short => |short| {
                 if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
-                    if (getShort(Args, field.name)) |s| {
+                    if (comptime getShort(Args, field.name)) |s| {
                         if (s == short) {
                             if (fieldStates.isSet(i_fields)) {
                                 return ArgParseError.DuplicateArgument;
                             }
 
-                            const wasSet = try setField(Args, field.type, @TypeOf(arrayFields), field.name, &@field(args, field.name), &arrayFields, cursor, allocator);
-                            if (wasSet) {
+                            if (comptime isFlag(field.type)) {
+                                @field(args, field.name) = true;
+                                fieldStates.set(i_fields);
+                            } // otherwise it has to be a value
+                            else if (comptime isSlice(field.type)) {
+                                if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
+                                i += 1;
+                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                                    Args,
+                                    field.name,
+                                    @typeInfo(field.type).pointer.child,
+                                ), argv[i..], allocator);
+                            } else {
+                                if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
+                                i += 1;
+                                @field(args, field.name) = try parseAs(field.type, argv[i], allocator, fieldConverter(
+                                    Args,
+                                    field.name,
+                                    field.type,
+                                ));
                                 fieldStates.set(i_fields);
                             }
                             continue :next;
@@ -380,8 +344,27 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
                         if (fieldStates.isSet(i_fields)) {
                             return ArgParseError.DuplicateArgument;
                         }
-                        const wasSet = try setField(Args, field.type, @TypeOf(arrayFields), field.name, &@field(args, field.name), &arrayFields, cursor, allocator);
-                        if (wasSet) {
+
+                        if (comptime isFlag(field.type)) {
+                            @field(args, field.name) = true;
+                            fieldStates.set(i_fields);
+                        } // otherwise it has to be a value
+                        else if (comptime isSlice(field.type)) {
+                            if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
+                            i += 1;
+                            i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                                Args,
+                                field.name,
+                                @typeInfo(field.type).pointer.child,
+                            ), argv[i..], allocator);
+                        } else {
+                            if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
+                            i += 1;
+                            @field(args, field.name) = try parseAs(field.type, argv[i], allocator, fieldConverter(
+                                Args,
+                                field.name,
+                                field.type,
+                            ));
                             fieldStates.set(i_fields);
                         }
                         continue :next;
@@ -422,6 +405,7 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
 }
 
 fn parseAs(comptime Arg: type, arg: []const u8, allocator: std.mem.Allocator, conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg) !Arg {
+    // std.debug.print("Parse {s} as  {any}\n", .{ arg, Arg });
     const argType = stripOpt(Arg);
     if (conversion) |convert| {
         return try convert(arg, allocator);
@@ -500,6 +484,36 @@ test "parse different raw args" {
     try std.testing.expect(named_arg == .longWithValue);
     try std.testing.expectEqualStrings(named_arg.longWithValue.key, "key");
     try std.testing.expectEqualStrings(named_arg.longWithValue.value, "value");
+    const short_val = try parseArg("-s10");
+    try std.testing.expect(short_val == .shortWithTail);
+    try std.testing.expectEqual(short_val.shortWithTail.key, 's');
+    try std.testing.expectEqualStrings(short_val.shortWithTail.tail, "10");
+    const short = try parseArg("-s");
+    try std.testing.expect(short == .short);
+    try std.testing.expectEqual(short.short, 's');
+    const eoo = try parseArg("--");
+    try std.testing.expect(eoo == .endOfOptions);
+}
+
+test "get short" {
+    const S = struct { short: bool };
+    try std.testing.expectEqual(getShort(S, "short"), 's');
+}
+
+test "get short null" {
+    const S = struct {
+        short: bool,
+        const short_short = null;
+    };
+    try std.testing.expectEqual(getShort(S, "short"), null);
+}
+
+test "get short rename" {
+    const S = struct {
+        short: bool,
+        const short_short = 'S';
+    };
+    try std.testing.expectEqual(getShort(S, "short"), 'S');
 }
 
 test "parse positional args basic" {
@@ -511,8 +525,7 @@ test "parse positional args basic" {
     };
 
     const args = [_][]const u8{ "42", "hello" };
-    var cursor = ArgCursor.init(args[0..]);
-    const result = try parseArgv(S, &cursor, allocator);
+    const result = try parseArgv(S, args[0..], allocator);
 
     try std.testing.expectEqual(@as(i32, 42), result._int);
     try std.testing.expectEqualStrings("hello", result._text);
@@ -526,8 +539,7 @@ test "named argument parsing" {
     };
 
     const args = [_][]const u8{"--key=zig"};
-    var cursor = ArgCursor.init(args[0..]);
-    const result = try parseArgv(S, &cursor, allocator);
+    const result = try parseArgv(S, args[0..], allocator);
 
     try std.testing.expectEqualStrings("zig", result.key);
 }
@@ -540,8 +552,7 @@ test "boolean flag parsing" {
     };
 
     const args = [_][]const u8{"--flag"};
-    var cursor = ArgCursor.init(args[0..]);
-    const result = try parseArgv(S, &cursor, allocator);
+    const result = try parseArgv(S, args[0..], allocator);
 
     try std.testing.expect(result.flag);
 }
@@ -554,8 +565,7 @@ test "unknown argument returns error" {
     };
 
     const args = [_][]const u8{"--something"};
-    var cursor = ArgCursor.init(args[0..]);
-    const result = parseArgv(S, &cursor, allocator);
+    const result = parseArgv(S, args[0..], allocator);
 
     try std.testing.expectError(
         ArgParseError.UnknownArgument,
@@ -572,8 +582,7 @@ test "missing required positional argument" {
     };
 
     const args = [_][]const u8{"123"};
-    var cursor = ArgCursor.init(args[0..]);
-    const result = parseArgv(S, &cursor, allocator);
+    const result = parseArgv(S, args[0..], allocator);
 
     try std.testing.expectError(
         ArgParseError.ArgumentMissing,
@@ -593,8 +602,7 @@ test "mixed named and positional args" {
         "--name=zig",
         "7",
     };
-    var cursor = ArgCursor.init(args[0..]);
-    const result = try parseArgv(S, &cursor, allocator);
+    const result = try parseArgv(S, args[0..], allocator);
 
     try std.testing.expectEqual(@as(i32, 7), result._int);
     try std.testing.expectEqualStrings("zig", result.name);
@@ -611,8 +619,7 @@ test "duplicate named argument returns error" {
         "--key=first",
         "--key=second",
     };
-    var cursor = ArgCursor.init(args[0..]);
-    try std.testing.expectError(ArgParseError.DuplicateArgument, parseArgv(S, &cursor, allocator));
+    try std.testing.expectError(ArgParseError.DuplicateArgument, parseArgv(S, args[0..], allocator));
 }
 
 test "positional order stability" {
@@ -624,8 +631,7 @@ test "positional order stability" {
     };
 
     const args = [_][]const u8{ "99", "world" };
-    var cursor = ArgCursor.init(args[0..]);
-    const result = try parseArgv(S, &cursor, allocator);
+    const result = try parseArgv(S, args[0..], allocator);
 
     try std.testing.expectEqual(@as(i32, 99), result._int);
     try std.testing.expectEqualStrings("world", result._text);
@@ -641,40 +647,42 @@ test "allocated arrays" {
     const expected = [_]i32{ 1, 2, 3 };
     {
         const args = [_][]const u8{ "--int", "1", "2", "3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
+        defer allocator.free(result.int);
+
+        try std.testing.expectEqualSlices(i32, expected[0..], result.int);
+    }
+    {
+        const args = [_][]const u8{ "--int", "1", "--int", "2", "3" };
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{"--int=1,2,3"};
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{ "--int=1,2", "--int", "3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{ "--int", "1", "--int=2,3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{ "--int", "1", "--int=2", "--int", "3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
@@ -689,8 +697,7 @@ test "optional values" {
     {
         const expected = S{ .int = 1, .float = 2.3 };
         const args = [_][]const u8{ "--int", "1", "--float=2.3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -698,8 +705,7 @@ test "optional values" {
     {
         const expected = S{ .int = 1, .float = null };
         const args = [_][]const u8{ "--int", "1" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -707,8 +713,7 @@ test "optional values" {
     {
         const expected = S{ .int = null, .float = 2.3 };
         const args = [_][]const u8{"--float=2.3"};
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -716,8 +721,7 @@ test "optional values" {
     {
         const expected = S{ .int = null, .float = null };
         const args = [_][]const u8{};
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -738,8 +742,7 @@ test "conversion provided" {
     {
         const expected = S{ .custom = T{ .int = 70 } };
         const args = [_][]const u8{ "--custom", "1" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -760,8 +763,7 @@ test "conversion provided for array" {
     const expectedArray = [_]T{ T{ .int = 70 }, T{ .int = 71 }, T{ .int = 72 } };
     {
         const args = [_][]const u8{ "--customArray", "1", "2", "3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -769,8 +771,7 @@ test "conversion provided for array" {
 
     {
         const args = [_][]const u8{"--customArray=1,2,3"};
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -778,8 +779,7 @@ test "conversion provided for array" {
 
     {
         const args = [_][]const u8{ "--customArray=1,2", "--customArray", "3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -787,8 +787,7 @@ test "conversion provided for array" {
 
     {
         const args = [_][]const u8{ "--customArray", "1", "--customArray=2,3" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -806,8 +805,7 @@ test "short provided" {
     {
         const expected = S{ .int = 1 };
         const args = [_][]const u8{ "-n", "1" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -825,8 +823,7 @@ test "short disabled" {
     {
         const expected = S{ .int = 2, .integer = 1 };
         const args = [_][]const u8{ "-i", "1", "--int", "2" };
-        var cursor = ArgCursor.init(args[0..]);
-        const result = try parseArgv(S, &cursor, allocator);
+        const result = try parseArgv(S, args[0..], allocator);
 
         try std.testing.expectEqual(expected, result);
     }
