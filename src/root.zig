@@ -47,9 +47,21 @@ pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.All
 }
 
 fn arrayArgs(comptime fields: anytype) type {
-    // 100 possible array arguments should be enough?
-    var field_names: [100][]const u8 = undefined;
-    var field_types: [100]type = undefined;
+    comptime var size = 0;
+
+    inline for (fields) |field| {
+        switch (@typeInfo(field.type)) {
+            .pointer => |ptr| {
+                if (ptr.size == .slice and ptr.child != u8)
+                    size += 1;
+            },
+            else => {
+                continue;
+            },
+        }
+    }
+    var field_names: [size][]const u8 = undefined;
+    var field_types: [size]type = undefined;
     var n_fields = 0;
     inline for (fields) |field| {
         switch (@typeInfo(field.type)) {
@@ -410,7 +422,6 @@ fn parseArgv(comptime Args: type, cursor: *ArgCursor, allocator: std.mem.Allocat
 }
 
 fn parseAs(comptime Arg: type, arg: []const u8, allocator: std.mem.Allocator, conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg) !Arg {
-    std.debug.print("Parsing: {s} as {any}\n", .{ arg, Arg });
     const argType = stripOpt(Arg);
     if (conversion) |convert| {
         return try convert(arg, allocator);
