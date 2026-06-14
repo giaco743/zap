@@ -23,165 +23,13 @@ pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.All
     return try parseArgv(Args, argv[1..], allocator);
 }
 
-fn arrayArgs(comptime fields: anytype) type {
-    comptime var size = 0;
-
-    inline for (fields) |field| {
-        switch (@typeInfo(field.type)) {
-            .pointer => |ptr| {
-                if (ptr.size == .slice and ptr.child != u8)
-                    size += 1;
-            },
-            else => {
-                continue;
-            },
-        }
-    }
-    var field_names: [size][]const u8 = undefined;
-    var field_types: [size]type = undefined;
-    var n_fields = 0;
-    inline for (fields) |field| {
-        switch (@typeInfo(field.type)) {
-            .pointer => |ptr| {
-                if (ptr.size == .slice and ptr.child != u8) {
-                    field_names[n_fields] = field.name;
-                    field_types[n_fields] = std.ArrayList(ptr.child);
-                    n_fields += 1;
-                }
-            },
-            else => {
-                continue;
-            },
-        }
-    }
-
-    return @Struct(.auto, null, field_names[0..n_fields], field_types[0..n_fields], &@splat(.{}));
-}
-
-fn initArrayArgs(
-    comptime Args: type,
-) Args {
-    var args: Args = undefined;
-
-    inline for (@typeInfo(Args).@"struct".fields) |field| {
-        @field(args, field.name) =
-            @TypeOf(@field(args, field.name)).empty;
-    }
-
-    return args;
-}
-
-fn deinitArrayArgs(arrayFields: anytype, allocator: std.mem.Allocator) void {
-    inline for (@typeInfo(@typeInfo(@TypeOf(arrayFields)).pointer.child).@"struct".fields) |field| {
-        @field(arrayFields.*, field.name).deinit(allocator);
-    }
-}
-
-fn stripOpt(comptime Type: type) type {
-    switch (@typeInfo(Type)) {
-        .optional => |opt| return opt.child,
-        else => return Type,
-    }
-}
-
-fn fieldConverter(comptime Args: type, fieldName: []const u8, comptime Arg: type) ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg {
-    const conversionName = "to_" ++ fieldName;
-    if (!@hasDecl(Args, conversionName)) {
-        return null;
-    }
-
-    const f = @field(Args, conversionName);
-
-    const ret = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
-
-    const ok = switch (@typeInfo(ret)) {
-        .error_union => |eu| eu.payload == Arg,
-        else => false,
-    };
-
-    if (!ok) return null;
-
-    return f;
-}
-
-fn isSlice(comptime Type: type) bool {
-    const info = @typeInfo(Type);
-    return info == .pointer and info.pointer.size == .slice and info.pointer.child != u8;
-}
-
-fn isFlag(comptime Type: type) bool {
-    const info = @typeInfo(Type);
-    return info == .bool;
-}
-
-fn getShort(comptime Args: type, comptime name: []const u8) ?u8 {
-    if (name.len == 0) return null;
-    if (std.mem.startsWith(u8, name, "_")) return null;
-    const short_decl = "short_" ++ name;
-    if (@hasDecl(Args, short_decl)) {
-        return @field(Args, short_decl);
-    }
-    return name[0];
-}
-
-fn setArrayArg(
-    comptime Item: type,
-    array: *std.ArrayList(Item),
-    conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Item,
-    argv: []const []const u8,
-    allocator: std.mem.Allocator,
-) !usize { // number of additionally handled fields, so I can increment always at the end of the loop with the syntax
-    if (argv.len > 0) {
-        if (try parseArg(argv[0]) != .value) {
-            return ArgParseError.NamedArgumentMissingValue;
-        }
-    } else {
-        return ArgParseError.NamedArgumentMissingValue;
-    }
-    var i: usize = 0;
-    while (i < argv.len) {
-        const next_arg = try parseArg(argv[i]);
-        try array.append(allocator, try parseAs(
-            Item,
-            next_arg.value,
-            allocator,
-            conversion,
-        ));
-        if (argv.len > i + 1) {
-            if (try parseArg(argv[i + 1]) != .value) {
-                break;
-            }
-        }
-        i += 1;
-    }
-    return i;
-}
-
-fn setArg(
-    comptime Arg: type,
-    field: *Arg,
-    value: []const u8,
-    conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg,
-    allocator: std.mem.Allocator,
-) !void {
-    comptime {
-        if (isSlice(Arg)) {
-            @compileError("Always make sure it is not an array");
-        }
-    }
-    if (@typeInfo(Arg) == .bool) {
-        field.* = true;
-    } else {
-        field.* = try parseAs(Arg, value, allocator, conversion);
-    }
-}
-
 fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.Allocator) !Args {
     var args: Args = undefined;
 
     const fields = @typeInfo(Args).@"struct".fields;
-    var arrayFields = initArrayArgs(arrayArgs(fields));
-    defer deinitArrayArgs(&arrayFields, allocator);
+    const ArrayArgs = arrayArgs(fields);
+    var arrayArguments = initArrayArgs(ArrayArgs);
+    defer deinitArrayArgs(&arrayArguments, allocator);
     var fieldStates = std.StaticBitSet(fields.len).initEmpty();
 
     var endOfOptions = false;
@@ -217,7 +65,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                 }
                             } // otherwise it has to be a value
                             else if (comptime isSlice(field.type)) {
-                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
                                     Args,
                                     field.name,
                                     @typeInfo(field.type).pointer.child,
@@ -257,7 +105,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                 const next: []const u8 = item;
                                 try list.append(allocator, next);
                             }
-                            _ = try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                            _ = try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
                                 Args,
                                 field.name,
                                 @typeInfo(field.type).pointer.child,
@@ -277,25 +125,27 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
             // positional argument
             .value => |value| {
                 inline for (fields, 0..) |field, i_fields| {
-                    if (!fieldStates.isSet(i_fields)) {
-                        if (comptime field.type == bool) {
-                            return ArgParseError.FlagAsPositional;
-                        } // otherwise it has to be a value
-                        else if (comptime isSlice(field.type)) {
-                            i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
-                                Args,
-                                field.name,
-                                @typeInfo(field.type).pointer.child,
-                            ), argv[i..], allocator);
-                        } else {
-                            @field(args, field.name) = try parseAs(field.type, value, allocator, fieldConverter(
-                                Args,
-                                field.name,
-                                field.type,
-                            ));
+                    if (comptime isPosArg(field.name)) {
+                        if (!fieldStates.isSet(i_fields)) {
+                            if (comptime field.type == bool) {
+                                return ArgParseError.FlagAsPositional;
+                            } // otherwise it has to be a value
+                            else if (comptime isSlice(field.type)) {
+                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
+                                    Args,
+                                    field.name,
+                                    @typeInfo(field.type).pointer.child,
+                                ), argv[i..], allocator);
+                            } else {
+                                @field(args, field.name) = try parseAs(field.type, value, allocator, fieldConverter(
+                                    Args,
+                                    field.name,
+                                    field.type,
+                                ));
+                                fieldStates.set(i_fields);
+                            }
+                            continue :next;
                         }
-                        fieldStates.set(i_fields);
-                        continue :next;
                     }
                 }
             },
@@ -316,7 +166,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                             else if (comptime isSlice(field.type)) {
                                 if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
                                 i += 1;
-                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
                                     Args,
                                     field.name,
                                     @typeInfo(field.type).pointer.child,
@@ -352,7 +202,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                         else if (comptime isSlice(field.type)) {
                             if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
                             i += 1;
-                            i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayFields, field.name), fieldConverter(
+                            i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
                                 Args,
                                 field.name,
                                 @typeInfo(field.type).pointer.child,
@@ -384,59 +234,19 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
     // Assign array arguments
     inline for (fields, 0..) |field, i_fields| {
         if (!fieldStates.isSet(i_fields)) {
-            switch (@typeInfo(field.type)) {
-                .bool => @field(args, field.name) = false,
-                .optional => @field(args, field.name) = null,
-                .pointer => |ptr| {
-                    if (ptr.size == .slice and ptr.child != u8) {
-                        const owned = try @field(arrayFields, field.name).toOwnedSlice(allocator);
-                        @field(args, field.name) = owned;
-                    } else {
-                        return ArgParseError.ArgumentMissing;
-                    }
-                },
-                else => {
-                    return ArgParseError.ArgumentMissing;
-                },
+            if (comptime isFlag(field.type)) {
+                @field(args, field.name) = false;
+            } else if (comptime isOpt(field.type)) {
+                @field(args, field.name) = null;
+            } else if (comptime isSlice(field.type)) {
+                const owned = try @field(arrayArguments, field.name).toOwnedSlice(allocator);
+                @field(args, field.name) = owned;
+            } else {
+                return ArgParseError.ArgumentMissing;
             }
         }
     }
     return args;
-}
-
-fn parseAs(comptime Arg: type, arg: []const u8, allocator: std.mem.Allocator, conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg) !Arg {
-    // std.debug.print("Parse {s} as  {any}\n", .{ arg, Arg });
-    const argType = stripOpt(Arg);
-    if (conversion) |convert| {
-        return try convert(arg, allocator);
-    }
-    if (argType == []const u8) {
-        return arg;
-    }
-    switch (@typeInfo(argType)) {
-        .int => {
-            return try std.fmt.parseInt(argType, arg, 10);
-        },
-        .float => {
-            return try std.fmt.parseFloat(argType, arg);
-        },
-        else => {
-            return ArgParseError.NeedsCustomConversion;
-        },
-    }
-}
-
-fn argvToSlices(
-    allocator: std.mem.Allocator,
-    argv: []const [*:0]const u8,
-) ![][]const u8 {
-    const result = try allocator.alloc([]const u8, argv.len);
-
-    for (argv, 0..) |arg, i| {
-        result[i] = std.mem.span(arg);
-    }
-
-    return result;
 }
 
 const ArgToken = union(enum) {
@@ -471,6 +281,167 @@ fn parseArg(arg: []const u8) !ArgToken {
         }
     }
     return .{ .value = arg };
+}
+
+fn parseAs(comptime Arg: type, arg: []const u8, allocator: std.mem.Allocator, conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg) !Arg {
+    // std.debug.print("Parse {s} as  {any}\n", .{ arg, Arg });
+    const argType = stripOpt(Arg);
+    if (conversion) |convert| {
+        return try convert(arg, allocator);
+    }
+    if (argType == []const u8) {
+        return arg;
+    }
+    switch (@typeInfo(argType)) {
+        .int => {
+            return try std.fmt.parseInt(argType, arg, 10);
+        },
+        .float => {
+            return try std.fmt.parseFloat(argType, arg);
+        },
+        else => {
+            return ArgParseError.NeedsCustomConversion;
+        },
+    }
+}
+
+fn arrayArgs(comptime fields: anytype) type {
+    comptime var size = 0;
+    inline for (fields) |field| {
+        if (isSlice(field.type)) {
+            size += 1;
+        }
+    }
+    var field_names: [size][]const u8 = undefined;
+    var field_types: [size]type = undefined;
+    var n_fields = 0;
+    inline for (fields) |field| {
+        if (isSlice(field.type)) {
+            field_names[n_fields] = field.name;
+            field_types[n_fields] = std.ArrayList(@typeInfo(field.type).pointer.child);
+            n_fields += 1;
+        }
+    }
+
+    return @Struct(.auto, null, field_names[0..n_fields], field_types[0..n_fields], &@splat(.{}));
+}
+
+fn initArrayArgs(
+    comptime Args: type,
+) Args {
+    var args: Args = undefined;
+
+    inline for (@typeInfo(Args).@"struct".fields) |field| {
+        @field(args, field.name) =
+            @TypeOf(@field(args, field.name)).empty;
+    }
+
+    return args;
+}
+
+fn deinitArrayArgs(arrayFields: anytype, allocator: std.mem.Allocator) void {
+    inline for (@typeInfo(@typeInfo(@TypeOf(arrayFields)).pointer.child).@"struct".fields) |field| {
+        @field(arrayFields.*, field.name).deinit(allocator);
+    }
+}
+
+fn setArrayArg(
+    comptime Item: type,
+    array: *std.ArrayList(Item),
+    conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Item,
+    argv: []const []const u8,
+    allocator: std.mem.Allocator,
+) !usize { // number of additionally handled fields, so I can increment always at the end of the loop with the syntax
+    if (argv.len > 0) {
+        if (try parseArg(argv[0]) != .value) return ArgParseError.NamedArgumentMissingValue;
+    } else return ArgParseError.NamedArgumentMissingValue;
+
+    var i: usize = 0;
+    while (i < argv.len) {
+        const next_arg = try parseArg(argv[i]);
+        try array.append(allocator, try parseAs(
+            Item,
+            next_arg.value,
+            allocator,
+            conversion,
+        ));
+        if (argv.len > i + 1) {
+            if (try parseArg(argv[i + 1]) != .value) {
+                break;
+            }
+        }
+        i += 1;
+    }
+    return i;
+}
+
+fn fieldConverter(comptime Args: type, fieldName: []const u8, comptime Arg: type) ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg {
+    const conversionName = "to_" ++ fieldName;
+    if (!@hasDecl(Args, conversionName)) {
+        return null;
+    }
+
+    const f = @field(Args, conversionName);
+
+    const ret = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+
+    const ok = switch (@typeInfo(ret)) {
+        .error_union => |eu| eu.payload == Arg,
+        else => false,
+    };
+
+    if (!ok) return null;
+
+    return f;
+}
+
+fn stripOpt(comptime Type: type) type {
+    switch (@typeInfo(Type)) {
+        .optional => |opt| return opt.child,
+        else => return Type,
+    }
+}
+
+fn isOpt(comptime Type: type) bool {
+    const info = @typeInfo(Type);
+    return info == .optional;
+}
+
+fn isSlice(comptime Type: type) bool {
+    const info = @typeInfo(Type);
+    return info == .pointer and info.pointer.size == .slice and info.pointer.child != u8;
+}
+
+fn isFlag(comptime Type: type) bool {
+    const info = @typeInfo(Type);
+    return info == .bool;
+}
+
+fn isPosArg(comptime FieldName: []const u8) bool {
+    return std.mem.startsWith(u8, FieldName, "_");
+}
+
+fn getShort(comptime Args: type, comptime name: []const u8) ?u8 {
+    if (name.len == 0) return null;
+    if (std.mem.startsWith(u8, name, "_")) return null;
+    const short_decl = "short_" ++ name;
+    if (@hasDecl(Args, short_decl)) {
+        return @field(Args, short_decl);
+    }
+    return name[0];
+}
+
+fn argvToSlices(
+    allocator: std.mem.Allocator,
+    argv: []const [*:0]const u8,
+) ![][]const u8 {
+    const result = try allocator.alloc([]const u8, argv.len);
+
+    for (argv, 0..) |arg, i| {
+        result[i] = std.mem.span(arg);
+    }
+
+    return result;
 }
 
 test "parse different raw args" {
