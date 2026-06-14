@@ -36,6 +36,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
     var i: usize = 0;
     next: while (i < argv.len) : (i += 1) {
         const arg = try parseArg(argv[i]);
+
         switch (arg) {
             .shortWithTail => |short| {
                 if (endOfOptions) return ArgParseError.EndOfOptions;
@@ -139,7 +140,19 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                 return ArgParseError.FlagAsPositional;
                             }
                             if (comptime isSlice(field.type)) {
-                                while (i < argv.len and try parseArg(argv[i]) == .value) {
+                                try @field(arrayArguments, field.name).append(allocator, try parseAs(
+                                    @typeInfo(field.type).pointer.child,
+                                    value,
+                                    allocator,
+                                    fieldConverter(
+                                        Args,
+                                        field.name,
+                                        @typeInfo(field.type).pointer.child,
+                                    ),
+                                ));
+
+                                while (i + 1 < argv.len and try parseArg(argv[i + 1]) == .value) {
+                                    i += 1;
                                     try @field(arrayArguments, field.name).append(allocator, try parseAs(
                                         @typeInfo(field.type).pointer.child,
                                         argv[i], // If it is a .value, we can just take the raw string
@@ -150,7 +163,6 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                             @typeInfo(field.type).pointer.child,
                                         ),
                                     ));
-                                    i += 1;
                                 }
                             } else {
                                 @field(args, field.name) = try parseAs(field.type, value, allocator, fieldConverter(
@@ -516,6 +528,24 @@ test "parse positional args basic" {
     defer allocator.free(result._elements);
 
     try std.testing.expectEqual(@as(i32, 42), result._int);
+    try std.testing.expectEqualStrings("hello", result._text);
+    try std.testing.expectEqualSlices(f32, &[4]f32{ 1.1, 2.2, 3.3, 4.4 }, result._elements);
+}
+
+test "parse positional args basic array begin" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        _elements: []const f32,
+        int: i32,
+        _text: []const u8,
+    };
+
+    const args = [_][]const u8{ "1.1", "2.2", "3.3", "4.4", "-i", "42", "hello" };
+    const result = try parseArgv(S, args[0..], allocator);
+    defer allocator.free(result._elements);
+
+    try std.testing.expectEqual(@as(i32, 42), result.int);
     try std.testing.expectEqualStrings("hello", result._text);
     try std.testing.expectEqualSlices(f32, &[4]f32{ 1.1, 2.2, 3.3, 4.4 }, result._elements);
 }
