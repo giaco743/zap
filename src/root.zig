@@ -65,11 +65,19 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                 }
                             } // otherwise it has to be a value
                             else if (comptime isSlice(field.type)) {
-                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
-                                    Args,
-                                    field.name,
-                                    @typeInfo(field.type).pointer.child,
-                                ), argv[i..], allocator);
+                                var it = std.mem.splitScalar(u8, short.tail, ',');
+                                while (it.next()) |value| {
+                                    try @field(arrayArguments, field.name).append(allocator, try parseAs(
+                                        @typeInfo(field.type).pointer.child,
+                                        value,
+                                        allocator,
+                                        fieldConverter(
+                                            Args,
+                                            field.name,
+                                            @typeInfo(field.type).pointer.child,
+                                        ),
+                                    ));
+                                }
                             } else {
                                 @field(args, field.name) = try parseAs(field.type, short.tail, allocator, fieldConverter(
                                     Args,
@@ -98,18 +106,18 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                         } // otherwise it has to be a value
                         else if (comptime isSlice(field.type)) {
                             var it = std.mem.splitScalar(u8, named.value, ',');
-                            var list = std.ArrayList([]const u8).empty;
-                            defer list.deinit(allocator);
-
-                            while (it.next()) |item| {
-                                const next: []const u8 = item;
-                                try list.append(allocator, next);
+                            while (it.next()) |value| {
+                                try @field(arrayArguments, field.name).append(allocator, try parseAs(
+                                    @typeInfo(field.type).pointer.child,
+                                    value,
+                                    allocator,
+                                    fieldConverter(
+                                        Args,
+                                        field.name,
+                                        @typeInfo(field.type).pointer.child,
+                                    ),
+                                ));
                             }
-                            _ = try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
-                                Args,
-                                field.name,
-                                @typeInfo(field.type).pointer.child,
-                            ), list.items, allocator);
                         } else {
                             @field(args, field.name) = try parseAs(field.type, named.value, allocator, fieldConverter(
                                 Args,
@@ -127,15 +135,23 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                 inline for (fields, 0..) |field, i_fields| {
                     if (comptime isPosArg(field.name)) {
                         if (!fieldStates.isSet(i_fields)) {
-                            if (comptime field.type == bool) {
+                            if (comptime isFlag(field.type)) {
                                 return ArgParseError.FlagAsPositional;
-                            } // otherwise it has to be a value
-                            else if (comptime isSlice(field.type)) {
-                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
-                                    Args,
-                                    field.name,
-                                    @typeInfo(field.type).pointer.child,
-                                ), argv[i..], allocator);
+                            }
+                            if (comptime isSlice(field.type)) {
+                                while (i < argv.len and try parseArg(argv[i]) == .value) {
+                                    try @field(arrayArguments, field.name).append(allocator, try parseAs(
+                                        @typeInfo(field.type).pointer.child,
+                                        argv[i], // If it is a .value, we can just take the raw string
+                                        allocator,
+                                        fieldConverter(
+                                            Args,
+                                            field.name,
+                                            @typeInfo(field.type).pointer.child,
+                                        ),
+                                    ));
+                                    i += 1;
+                                }
                             } else {
                                 @field(args, field.name) = try parseAs(field.type, value, allocator, fieldConverter(
                                     Args,
@@ -164,15 +180,21 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                 fieldStates.set(i_fields);
                             } // otherwise it has to be a value
                             else if (comptime isSlice(field.type)) {
-                                if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
-                                i += 1;
-                                i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
-                                    Args,
-                                    field.name,
-                                    @typeInfo(field.type).pointer.child,
-                                ), argv[i..], allocator);
+                                while (i + 1 < argv.len and try parseArg(argv[i + 1]) == .value) {
+                                    i = i + 1;
+                                    try @field(arrayArguments, field.name).append(allocator, try parseAs(
+                                        @typeInfo(field.type).pointer.child,
+                                        argv[i], // If it is a .value, we can just take the raw string
+                                        allocator,
+                                        fieldConverter(
+                                            Args,
+                                            field.name,
+                                            @typeInfo(field.type).pointer.child,
+                                        ),
+                                    ));
+                                }
                             } else {
-                                if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
+                                if (i + 1 >= argv.len or try parseArg(argv[i + 1]) != .value) return ArgParseError.NamedArgumentMissingValue;
                                 i += 1;
                                 @field(args, field.name) = try parseAs(field.type, argv[i], allocator, fieldConverter(
                                     Args,
@@ -200,13 +222,19 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                             fieldStates.set(i_fields);
                         } // otherwise it has to be a value
                         else if (comptime isSlice(field.type)) {
-                            if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
-                            i += 1;
-                            i += try setArrayArg(@typeInfo(field.type).pointer.child, &@field(arrayArguments, field.name), fieldConverter(
-                                Args,
-                                field.name,
-                                @typeInfo(field.type).pointer.child,
-                            ), argv[i..], allocator);
+                            while (i + 1 < argv.len and try parseArg(argv[i + 1]) == .value) {
+                                i = i + 1;
+                                try @field(arrayArguments, field.name).append(allocator, try parseAs(
+                                    @typeInfo(field.type).pointer.child,
+                                    argv[i], // If it is a .value, we can just take the raw string
+                                    allocator,
+                                    fieldConverter(
+                                        Args,
+                                        field.name,
+                                        @typeInfo(field.type).pointer.child,
+                                    ),
+                                ));
+                            }
                         } else {
                             if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
                             i += 1;
@@ -349,30 +377,17 @@ fn setArrayArg(
     comptime Item: type,
     array: *std.ArrayList(Item),
     conversion: ?fn ([]const u8, std.mem.Allocator) ArgParseError!Item,
-    argv: []const []const u8,
+    values: []const []const u8,
     allocator: std.mem.Allocator,
-) !usize { // number of additionally handled fields, so I can increment always at the end of the loop with the syntax
-    if (argv.len > 0) {
-        if (try parseArg(argv[0]) != .value) return ArgParseError.NamedArgumentMissingValue;
-    } else return ArgParseError.NamedArgumentMissingValue;
-
-    var i: usize = 0;
-    while (i < argv.len) {
-        const next_arg = try parseArg(argv[i]);
+) !void { // number of additionally handled fields, so I can increment always at the end of the loop with the syntax
+    for (values) |value| {
         try array.append(allocator, try parseAs(
             Item,
-            next_arg.value,
+            value,
             allocator,
             conversion,
         ));
-        if (argv.len > i + 1) {
-            if (try parseArg(argv[i + 1]) != .value) {
-                break;
-            }
-        }
-        i += 1;
     }
-    return i;
 }
 
 fn fieldConverter(comptime Args: type, fieldName: []const u8, comptime Arg: type) ?fn ([]const u8, std.mem.Allocator) ArgParseError!Arg {
@@ -493,13 +508,16 @@ test "parse positional args basic" {
     const S = struct {
         _int: i32,
         _text: []const u8,
+        _elements: []const f32,
     };
 
-    const args = [_][]const u8{ "42", "hello" };
+    const args = [_][]const u8{ "42", "hello", "1.1", "2.2", "3.3", "4.4" };
     const result = try parseArgv(S, args[0..], allocator);
+    defer allocator.free(result._elements);
 
     try std.testing.expectEqual(@as(i32, 42), result._int);
     try std.testing.expectEqualStrings("hello", result._text);
+    try std.testing.expectEqualSlices(f32, &[4]f32{ 1.1, 2.2, 3.3, 4.4 }, result._elements);
 }
 
 test "named argument parsing" {

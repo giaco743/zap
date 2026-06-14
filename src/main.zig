@@ -7,7 +7,7 @@ const Args = struct {
     _files: []const []const u8,
     string: []const u8,
     int: u32,
-    afloat: f16,
+    float: f16,
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("String: {s}, int: {}, float: {}, array {any}\n", .{
         args.string,
         args.int,
-        args.afloat,
+        args.float,
         args._files,
     });
 }
