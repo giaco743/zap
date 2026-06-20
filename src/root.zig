@@ -101,7 +101,6 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                             return ArgParseError.DuplicateArgument;
                         }
 
-                        // if first short is a flag the rest has to be flags as well
                         if (comptime field.type == bool) {
                             return ArgParseError.FlagWithValue;
                         } // otherwise it has to be a value
@@ -170,8 +169,8 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                     field.name,
                                     field.type,
                                 ));
-                                fieldStates.set(i_fields);
                             }
+                            fieldStates.set(i_fields);
                             continue :next;
                         }
                     }
@@ -248,7 +247,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                 ));
                             }
                         } else {
-                            if (i + 1 >= argv.len) return ArgParseError.NamedArgumentMissingValue;
+                            if (i + 1 >= argv.len or try parseArg(argv[i + 1]) != .value) return ArgParseError.NamedArgumentMissingValue;
                             i += 1;
                             @field(args, field.name) = try parseAs(field.type, argv[i], allocator, fieldConverter(
                                 Args,
@@ -273,15 +272,19 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
     // Check if all mandatory fields are set and handle unset flags and optionals
     // Assign array arguments
     inline for (fields, 0..) |field, i_fields| {
+        if (comptime isSlice(field.type)) {
+            const owned = try @field(arrayArguments, field.name).toOwnedSlice(allocator);
+            @field(args, field.name) = owned;
+            fieldStates.set(i_fields);
+        }
         if (!fieldStates.isSet(i_fields)) {
             if (comptime isFlag(field.type)) {
                 @field(args, field.name) = false;
             } else if (comptime isOpt(field.type)) {
                 @field(args, field.name) = null;
-            } else if (comptime isSlice(field.type)) {
-                const owned = try @field(arrayArguments, field.name).toOwnedSlice(allocator);
-                @field(args, field.name) = owned;
             } else {
+                // const arg_type = if (isPosArg(field.name)) "positional argument" else "option";
+                // const arg_name = if (isPosArg(field.name)) field.name[1..] else "--" ++ field.name;
                 return ArgParseError.ArgumentMissing;
             }
         }
