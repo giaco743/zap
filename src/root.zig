@@ -13,17 +13,71 @@ pub const ArgParseError = error{
     Overflow,
     EndOfOptions,
     InvalidCharacter,
-    AmbiguousShort,
     FlagAsPositional,
 };
 
-pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.Allocator) !Args {
-    const argv = try argvToSlices(allocator, args.vector);
+const ParseErrorInfo = struct {
+    field_name: []const u8,
+};
+
+pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.Allocator) Args {
+    const argv = argvToSlices(allocator, args.vector) catch {
+        std.process.exit(1);
+    };
     defer allocator.free(argv);
-    return try parseArgv(Args, argv[1..], allocator);
+
+    var errorInfo: ParseErrorInfo = undefined;
+    return parseArgv(Args, argv[1..], allocator, &errorInfo) catch |e| {
+        printErrorInfo(e, errorInfo);
+        std.process.exit(1);
+    };
 }
 
-fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.Allocator) !Args {
+fn printErrorInfo(errorKind: ArgParseError, errorInfo: ParseErrorInfo) void {
+    switch (errorKind) {
+        error.ArgumentMissing => {
+            std.debug.print("Argument '{s}' is missing.", .{errorInfo.field_name});
+        },
+        error.DuplicateArgument => {
+            std.debug.print("Argument '{s}' is provided multiple times, but it is not an array type.", .{errorInfo.field_name});
+        },
+        error.UnknownArgument => {
+            std.debug.print("Argument '{s}' is unknown.", .{errorInfo.field_name});
+        },
+        error.NamedArgumentMissingValue => {
+            std.debug.print("Argument '{s}' is a value.", .{errorInfo.field_name});
+        },
+        error.NeedsCustomConversion => {
+            std.debug.print("Argument '{s}' needs a custom conversion function.", .{errorInfo.field_name});
+        },
+        error.OptionMissing => {
+            std.debug.print("Argument '{s}' is missing.", .{errorInfo.field_name});
+        },
+        error.InvalidShort => {
+            std.debug.print("Invalid short form for argument '{s}' provided.", .{errorInfo.field_name});
+        },
+        error.InvalidLong => {
+            std.debug.print("Invalid long form for argument '{s}' provided.", .{errorInfo.field_name});
+        },
+        error.FlagWithValue => {
+            std.debug.print("Flag argument '{s}' with value is not allowed.", .{errorInfo.field_name});
+        },
+        error.Overflow => {
+            std.debug.print("Overflow.", .{});
+        },
+        error.EndOfOptions => {
+            std.debug.print("End of options was reached.", .{});
+        },
+        error.InvalidCharacter => {
+            std.debug.print("Could nor parse value for argument '{s}'.", .{errorInfo.field_name});
+        },
+        error.FlagAsPositional => {
+            std.debug.print("Boolean values have to be provided as flag. Argument '{s}'' is invalid.", .{errorInfo.field_name});
+        },
+    }
+}
+
+fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.Allocator, errorInfo: *ParseErrorInfo) ArgParseError!Args {
     var args: Args = undefined;
 
     const fields = @typeInfo(Args).@"struct".fields;
@@ -43,9 +97,8 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                 inline for (fields, 0..) |field, i_fields| {
                     if (comptime getShort(Args, field.name)) |s| {
                         if (s == short.key) {
-                            if (fieldStates.isSet(i_fields)) {
-                                return ArgParseError.DuplicateArgument;
-                            }
+                            errorInfo.field_name = "--" ++ field.name;
+                            if (fieldStates.isSet(i_fields)) return ArgParseError.DuplicateArgument;
 
                             // if first short is a flag the rest has to be flags as well
                             if (comptime field.type == bool) {
@@ -55,10 +108,12 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                                 inline for (fields, 0..) |f, j| {
                                     if (comptime getShort(Args, f.name)) |ss| {
                                         if (std.mem.containsAtLeastScalar2(u8, short.tail, 1, ss)) {
+                                            errorInfo.field_name = "--" ++ f.name;
                                             if (comptime isFlag(f.type)) {
                                                 @field(args, fields[j].name) = true;
                                                 fieldStates.set(j);
                                             } else {
+                                                errorInfo.field_name = "--" ++ field.name;
                                                 return ArgParseError.InvalidShort;
                                             }
                                         }
@@ -97,6 +152,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                 if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
                     if (std.mem.eql(u8, field.name, named.key)) {
+                        errorInfo.field_name = "--" ++ field.name;
                         if (fieldStates.isSet(i_fields)) {
                             return ArgParseError.DuplicateArgument;
                         }
@@ -135,9 +191,8 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                 inline for (fields, 0..) |field, i_fields| {
                     if (comptime isPosArg(field.name)) {
                         if (!fieldStates.isSet(i_fields)) {
-                            if (comptime isFlag(field.type)) {
-                                return ArgParseError.FlagAsPositional;
-                            }
+                            errorInfo.field_name = field.name[1..];
+                            if (comptime isFlag(field.type)) return ArgParseError.FlagAsPositional;
                             if (comptime isSlice(field.type)) {
                                 try @field(arrayArguments, field.name).append(allocator, try parseAs(
                                     @typeInfo(field.type).pointer.child,
@@ -182,6 +237,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                 inline for (fields, 0..) |field, i_fields| {
                     if (comptime getShort(Args, field.name)) |s| {
                         if (s == short) {
+                            errorInfo.field_name = "--" ++ field.name;
                             if (fieldStates.isSet(i_fields)) {
                                 return ArgParseError.DuplicateArgument;
                             }
@@ -224,6 +280,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
                 if (endOfOptions) return ArgParseError.EndOfOptions;
                 inline for (fields, 0..) |field, i_fields| {
                     if (std.mem.eql(u8, field.name, name)) {
+                        errorInfo.field_name = "--" ++ field.name;
                         if (fieldStates.isSet(i_fields)) {
                             return ArgParseError.DuplicateArgument;
                         }
@@ -283,8 +340,7 @@ fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.A
             } else if (comptime isOpt(field.type)) {
                 @field(args, field.name) = null;
             } else {
-                // const arg_type = if (isPosArg(field.name)) "positional argument" else "option";
-                // const arg_name = if (isPosArg(field.name)) field.name[1..] else "--" ++ field.name;
+                errorInfo.field_name = if (isPosArg(field.name)) field.name[1..] else "--" ++ field.name;
                 return ArgParseError.ArgumentMissing;
             }
         }
@@ -527,7 +583,8 @@ test "parse positional args basic" {
     };
 
     const args = [_][]const u8{ "42", "hello", "1.1", "2.2", "3.3", "4.4" };
-    const result = try parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = try parseArgv(S, args[0..], allocator, &errorInfo);
     defer allocator.free(result._elements);
 
     try std.testing.expectEqual(@as(i32, 42), result._int);
@@ -545,7 +602,8 @@ test "parse positional args basic array begin" {
     };
 
     const args = [_][]const u8{ "1.1", "2.2", "3.3", "4.4", "-i", "42", "hello" };
-    const result = try parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = try parseArgv(S, args[0..], allocator, &errorInfo);
     defer allocator.free(result._elements);
 
     try std.testing.expectEqual(@as(i32, 42), result.int);
@@ -561,7 +619,8 @@ test "named argument parsing" {
     };
 
     const args = [_][]const u8{"--key=zig"};
-    const result = try parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
     try std.testing.expectEqualStrings("zig", result.key);
 }
@@ -574,7 +633,8 @@ test "boolean flag parsing" {
     };
 
     const args = [_][]const u8{"--flag"};
-    const result = try parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
     try std.testing.expect(result.flag);
 }
@@ -587,7 +647,8 @@ test "unknown argument returns error" {
     };
 
     const args = [_][]const u8{"--something"};
-    const result = parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = parseArgv(S, args[0..], allocator, &errorInfo);
 
     try std.testing.expectError(
         ArgParseError.UnknownArgument,
@@ -604,7 +665,8 @@ test "missing required positional argument" {
     };
 
     const args = [_][]const u8{"123"};
-    const result = parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = parseArgv(S, args[0..], allocator, &errorInfo);
 
     try std.testing.expectError(
         ArgParseError.ArgumentMissing,
@@ -624,7 +686,8 @@ test "mixed named and positional args" {
         "--name=zig",
         "7",
     };
-    const result = try parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
     try std.testing.expectEqual(@as(i32, 7), result._int);
     try std.testing.expectEqualStrings("zig", result.name);
@@ -641,7 +704,8 @@ test "duplicate named argument returns error" {
         "--key=first",
         "--key=second",
     };
-    try std.testing.expectError(ArgParseError.DuplicateArgument, parseArgv(S, args[0..], allocator));
+    var errorInfo: ParseErrorInfo = undefined;
+    try std.testing.expectError(ArgParseError.DuplicateArgument, parseArgv(S, args[0..], allocator, &errorInfo));
 }
 
 test "positional order stability" {
@@ -653,7 +717,8 @@ test "positional order stability" {
     };
 
     const args = [_][]const u8{ "99", "world" };
-    const result = try parseArgv(S, args[0..], allocator);
+    var errorInfo: ParseErrorInfo = undefined;
+    const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
     try std.testing.expectEqual(@as(i32, 99), result._int);
     try std.testing.expectEqualStrings("world", result._text);
@@ -669,42 +734,48 @@ test "allocated arrays" {
     const expected = [_]i32{ 1, 2, 3 };
     {
         const args = [_][]const u8{ "--int", "1", "2", "3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{ "--int", "1", "--int", "2", "3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{"--int=1,2,3"};
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{ "--int=1,2", "--int", "3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{ "--int", "1", "--int=2,3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
     }
     {
         const args = [_][]const u8{ "--int", "1", "--int=2", "--int", "3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.int);
 
         try std.testing.expectEqualSlices(i32, expected[0..], result.int);
@@ -719,7 +790,8 @@ test "optional values" {
     {
         const expected = S{ .int = 1, .float = 2.3 };
         const args = [_][]const u8{ "--int", "1", "--float=2.3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -727,7 +799,8 @@ test "optional values" {
     {
         const expected = S{ .int = 1, .float = null };
         const args = [_][]const u8{ "--int", "1" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -735,7 +808,8 @@ test "optional values" {
     {
         const expected = S{ .int = null, .float = 2.3 };
         const args = [_][]const u8{"--float=2.3"};
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -743,7 +817,8 @@ test "optional values" {
     {
         const expected = S{ .int = null, .float = null };
         const args = [_][]const u8{};
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -764,7 +839,8 @@ test "conversion provided" {
     {
         const expected = S{ .custom = T{ .int = 70 } };
         const args = [_][]const u8{ "--custom", "1" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -785,7 +861,8 @@ test "conversion provided for array" {
     const expectedArray = [_]T{ T{ .int = 70 }, T{ .int = 71 }, T{ .int = 72 } };
     {
         const args = [_][]const u8{ "--customArray", "1", "2", "3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -793,7 +870,8 @@ test "conversion provided for array" {
 
     {
         const args = [_][]const u8{"--customArray=1,2,3"};
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -801,7 +879,8 @@ test "conversion provided for array" {
 
     {
         const args = [_][]const u8{ "--customArray=1,2", "--customArray", "3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -809,7 +888,8 @@ test "conversion provided for array" {
 
     {
         const args = [_][]const u8{ "--customArray", "1", "--customArray=2,3" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
         defer allocator.free(result.customArray);
 
         try std.testing.expectEqualSlices(T, expectedArray[0..], result.customArray);
@@ -827,7 +907,8 @@ test "short provided" {
     {
         const expected = S{ .int = 1 };
         const args = [_][]const u8{ "-n", "1" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
         try std.testing.expectEqual(expected, result);
     }
@@ -845,7 +926,8 @@ test "short disabled" {
     {
         const expected = S{ .int = 2, .integer = 1 };
         const args = [_][]const u8{ "-i", "1", "--int", "2" };
-        const result = try parseArgv(S, args[0..], allocator);
+        var errorInfo: ParseErrorInfo = undefined;
+        const result = try parseArgv(S, args[0..], allocator, &errorInfo);
 
         try std.testing.expectEqual(expected, result);
     }
