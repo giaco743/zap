@@ -26,55 +26,153 @@ pub fn parse(comptime Args: type, args: std.process.Args, allocator: std.mem.All
     };
     defer allocator.free(argv);
 
+    if (argv.len == 2 and std.mem.eql(u8, argv[1], "--help")) {
+        const help = printHelp(Args, allocator) catch {
+            std.process.exit(1);
+        };
+        defer allocator.free(help);
+        std.debug.print("{s}", .{help});
+        std.process.exit(0);
+    }
+
     var errorInfo: ParseErrorInfo = undefined;
     return parseArgv(Args, argv[1..], allocator, &errorInfo) catch |e| {
-        printErrorInfo(e, errorInfo);
+        const err = printErrorInfo(e, errorInfo, allocator) catch {
+            std.process.exit(1);
+        };
+        defer allocator.free(err);
+        const usage = printUsage(Args, allocator) catch {
+            std.process.exit(1);
+        };
+        defer allocator.free(usage);
+        std.debug.print("{s}\n", .{err});
+        std.debug.print("{s}\n", .{usage});
         std.process.exit(1);
     };
 }
 
-fn printErrorInfo(errorKind: ArgParseError, errorInfo: ParseErrorInfo) void {
+fn printErrorInfo(errorKind: ArgParseError, errorInfo: ParseErrorInfo, allocator: std.mem.Allocator) ![]const u8 {
+    var w = std.Io.Writer.Allocating.init(allocator);
+    defer w.deinit();
+
     switch (errorKind) {
         error.ArgumentMissing => {
-            std.debug.print("Argument '{s}' is missing.", .{errorInfo.field_name});
+            try w.writer.print("Argument '{s}' is missing.", .{errorInfo.field_name});
         },
         error.DuplicateArgument => {
-            std.debug.print("Argument '{s}' is provided multiple times, but it is not an array type.", .{errorInfo.field_name});
+            try w.writer.print("Argument '{s}' is provided multiple times, but it is not an array type.", .{errorInfo.field_name});
         },
         error.UnknownArgument => {
-            std.debug.print("Argument '{s}' is unknown.", .{errorInfo.field_name});
+            try w.writer.print("Argument '{s}' is unknown.", .{errorInfo.field_name});
         },
         error.NamedArgumentMissingValue => {
-            std.debug.print("Argument '{s}' is a value.", .{errorInfo.field_name});
+            try w.writer.print("Argument '{s}' is a value.", .{errorInfo.field_name});
         },
         error.NeedsCustomConversion => {
-            std.debug.print("Argument '{s}' needs a custom conversion function.", .{errorInfo.field_name});
+            try w.writer.print("Argument '{s}' needs a custom conversion function.", .{errorInfo.field_name});
         },
         error.OptionMissing => {
-            std.debug.print("Argument '{s}' is missing.", .{errorInfo.field_name});
+            try w.writer.print("Argument '{s}' is missing.", .{errorInfo.field_name});
         },
         error.InvalidShort => {
-            std.debug.print("Invalid short form for argument '{s}' provided.", .{errorInfo.field_name});
+            try w.writer.print("Invalid short form for argument '{s}' provided.", .{errorInfo.field_name});
         },
         error.InvalidLong => {
-            std.debug.print("Invalid long form for argument '{s}' provided.", .{errorInfo.field_name});
+            try w.writer.print("Invalid long form for argument '{s}' provided.", .{errorInfo.field_name});
         },
         error.FlagWithValue => {
-            std.debug.print("Flag argument '{s}' with value is not allowed.", .{errorInfo.field_name});
+            try w.writer.print("Flag argument '{s}' with value is not allowed.", .{errorInfo.field_name});
         },
         error.Overflow => {
-            std.debug.print("Overflow.", .{});
+            try w.writer.print("Overflow.", .{});
         },
         error.EndOfOptions => {
-            std.debug.print("End of options was reached.", .{});
+            try w.writer.print("End of options was reached.", .{});
         },
         error.InvalidCharacter => {
-            std.debug.print("Could nor parse value for argument '{s}'.", .{errorInfo.field_name});
+            try w.writer.print("Could nor parse value for argument '{s}'.", .{errorInfo.field_name});
         },
         error.FlagAsPositional => {
-            std.debug.print("Boolean values have to be provided as flag. Argument '{s}'' is invalid.", .{errorInfo.field_name});
+            try w.writer.print("Boolean values have to be provided as flag. Argument '{s}'' is invalid.", .{errorInfo.field_name});
         },
     }
+    return try w.toOwnedSlice();
+}
+
+fn printUsage(comptime Args: type, allocator: std.mem.Allocator) ![]const u8 {
+    var w = std.Io.Writer.Allocating.init(allocator);
+    defer w.deinit();
+
+    const cli = try std.ascii.allocLowerString(allocator, @typeName(Args));
+    defer allocator.free(cli);
+
+    const prog = if (std.mem.lastIndexOfScalar(u8, cli, '.')) |i|
+        cli[i + 1 ..]
+    else
+        cli;
+    try w.writer.print("Usage: {s} [OPTION]...", .{prog});
+
+    const fields = @typeInfo(Args).@"struct".fields;
+    inline for (fields) |field| {
+        if (comptime isPosArg(field.name)) {
+            const opt = try std.ascii.allocUpperString(allocator, field.name[1..]);
+            defer allocator.free(opt);
+
+            if (comptime isSlice(field.type)) {
+                try w.writer.print(" [{s}]...", .{opt});
+            } else {
+                try w.writer.print(" {s}", .{opt});
+            }
+        }
+    }
+
+    return w.toOwnedSlice();
+}
+
+fn printHelp(comptime Args: type, allocator: std.mem.Allocator) ![]const u8 {
+    var w = std.Io.Writer.Allocating.init(allocator);
+    defer w.deinit();
+
+    const usage = printUsage(Args, allocator) catch {
+        std.process.exit(1);
+    };
+    defer allocator.free(usage);
+
+    try w.writer.print("{s}\n", .{usage});
+
+    if (getDescription(Args)) |desc| {
+        try w.writer.print("{s}\n", .{desc});
+    }
+
+    const fields = @typeInfo(Args).@"struct".fields;
+    inline for (fields) |field| {
+        if (comptime isPosArg(field.name)) {
+            const pos = try std.ascii.allocUpperString(allocator, field.name[1..]);
+            defer allocator.free(pos);
+            if (comptime getOptDescription(Args, field.name)) |desc| {
+                try w.writer.print("{s} {s}\n", .{ pos, desc });
+            } else {
+                try w.writer.print("{s}\n", .{pos});
+            }
+        }
+    }
+    try w.writer.print("\n", .{});
+    inline for (fields) |field| {
+        if (!comptime isPosArg(field.name)) {
+            if (getShort(Args, field.name)) |s| {
+                try w.writer.print("  -{c},", .{s});
+            } else {
+                try w.writer.print("     ", .{});
+            }
+            try w.writer.print("  {s:<20}", .{field.name});
+            if (comptime getOptDescription(Args, field.name)) |desc| {
+                try w.writer.print(" {s}\n", .{desc});
+            } else {
+                try w.writer.print("\n", .{});
+            }
+        }
+    }
+    return try w.toOwnedSlice();
 }
 
 fn parseArgv(comptime Args: type, argv: []const []const u8, allocator: std.mem.Allocator, errorInfo: *ParseErrorInfo) ArgParseError!Args {
@@ -515,6 +613,23 @@ fn getShort(comptime Args: type, comptime name: []const u8) ?u8 {
         return @field(Args, short_decl);
     }
     return name[0];
+}
+
+fn getDescription(comptime Args: type) ?[]const u8 {
+    if (@hasDecl(Args, "description")) {
+        return @field(Args, "description");
+    }
+    return null;
+}
+
+fn getOptDescription(comptime Args: type, name: []const u8) ?[]const u8 {
+    if (name.len == 0) return null;
+
+    const description = name ++ "_description";
+    if (@hasDecl(Args, description)) {
+        return @field(Args, description);
+    }
+    return null;
 }
 
 fn argvToSlices(
