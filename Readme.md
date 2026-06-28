@@ -75,3 +75,44 @@ FILE
   -i,  int                 
        float                An ordinary float
 ```
+
+# Use `zap` in your project
+
+To use zap in your project use:
+
+> zig fetch --save "https://github.com/giaco743/zap/archive/refs/tags/v0.1.0.tar.gz"
+
+If this worked successfully you should see something like this in your `build.zig.zon` :
+
+```zig
+...
+.dependencies = .{
+    ...
+    .zap = .{
+        .url = "https://github.com/giaco743/zap/archive/refs/tags/v0.1.0.tar.gz",
+        .hash = "zap-0.0.0-8Lu0GzzJAADkmGjpXmqBuzjFp4v-YC7MNfGS53IIG1d9",
+    },
+    ...
+},
+...
+```
+
+Add it as a dependency in your `build.zig` :
+
+```zig
+...
+const zap = b.dependency("zap", .{
+    .target = target,
+    .optimize = optimize,
+});
+...
+exe.root_module.addImport("zap", zap.module("zap"));
+...
+
+```
+
+and then import it in your `main.zig` :
+
+```zig
+const zap = @import("zap")
+```
