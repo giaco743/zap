@@ -39,7 +39,11 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .optimize = optimize,
     });
+
+    const lib = b.addLibrary(.{ .name = "zap", .root_module = mod });
+    b.installArtifact(lib);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
